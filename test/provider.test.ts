@@ -170,15 +170,23 @@ describe("provider.createZoteroLocalProvider", () => {
 		resetLocalAuthCache();
 	});
 
-	it("login obtains a key via the /api/local/authorize handshake", async () => {
-		const handle = mockFetch((c) =>
-			c.method === "POST" && c.url === "http://127.0.0.1:23119/api/local/authorize"
-				? { status: 200, body: { key: "LOK123", remember: true } }
-				: undefined,
-		);
+	it("login discovers the Zotero-Server-ID, then obtains a key via /api/local/authorize", async () => {
+		const handle = mockFetch((c) => {
+			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
+				return { status: 200, body: "Nothing to see here.", headers: { "Zotero-Server-ID": "SID1" } };
+			}
+			if (c.method === "POST" && c.url === "http://127.0.0.1:23119/api/local/authorize") {
+				return { status: 200, body: { key: "LOK123", remember: true } };
+			}
+			return undefined;
+		});
 		const cred = await createZoteroLocalProvider().auth!.apiKey!.login!(fakeInteraction("x"));
 		assert.equal((cred as { key?: string }).key, "LOK123");
-		const call = handle.calls[0]!;
+		const discovery = handle.calls[0]!;
+		const call = handle.calls[1]!;
+		assert.equal(call.method, "POST");
+		// The handshake itself is a write-method request: it must echo Zotero-Server-ID.
+		assert.equal(call.headers["zotero-server-id"], "SID1");
 		assert.deepEqual(JSON.parse(call.body as string), { appName: "pi" });
 		handle.restore();
 	});
@@ -189,7 +197,7 @@ describe("provider.createZoteroLocalProvider", () => {
 			() => createZoteroLocalProvider().auth!.apiKey!.login!(fakeInteraction("x")),
 			/Allow/,
 		);
-		assert.equal(handle.calls.length, 3); // 3 attempts, then the helpful error
+		assert.equal(handle.calls.length, 6); // 3 attempts x (failed discovery + authorize)
 		handle.restore();
 	});
 

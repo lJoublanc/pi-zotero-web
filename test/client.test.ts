@@ -555,7 +555,7 @@ describe("client local mode", () => {
 	it("writes discover the Zotero-Server-ID first and echo it", async () => {
 		const handle = mockFetch((c) => {
 			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
-				return { status: 200, body: "Nothing to see here.", headers: { "X-Zotero-Server-ID": "SID123" } };
+				return { status: 200, body: "Nothing to see here.", headers: { "Zotero-Server-ID": "SID123" } };
 			}
 			if (c.method === "PATCH" && c.url === "http://127.0.0.1:23119/api/users/0/items/K") return { status: 204, body: "" };
 			return undefined;
@@ -571,7 +571,7 @@ describe("client local mode", () => {
 	it("retries a 401 write via /api/local/authorize and uses the fresh key", async () => {
 		const handle = mockFetch((c) => {
 			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
-				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+				return { status: 200, body: "x", headers: { "Zotero-Server-ID": "SID1" } };
 			}
 			if (c.method === "PATCH" && c.url.endsWith("/users/0/items/K")) {
 				// note: _mock pushes the current call *before* the matcher runs, so the
@@ -599,7 +599,7 @@ describe("client local mode", () => {
 	it("surfaces real 412 version conflicts without retrying", async () => {
 		const handle = mockFetch((c) => {
 			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
-				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+				return { status: 200, body: "x", headers: { "Zotero-Server-ID": "SID1" } };
 			}
 			if (c.method === "PATCH" && c.url.endsWith("/users/0/items/K")) {
 				return { status: 412, body: "item has been modified since specified version (expected 7, found 9)" };
@@ -621,7 +621,7 @@ describe("client local mode", () => {
 		let libraryVersion = 5;
 		const handle = mockFetch((c) => {
 			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
-				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+				return { status: 200, body: "x", headers: { "Zotero-Server-ID": "SID1" } };
 			}
 			if (c.method === "GET" && c.url.endsWith("/users/0/items?limit=1&format=json")) {
 				const v = libraryVersion;

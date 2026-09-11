@@ -7,9 +7,12 @@ import {
 	ZOTERO_LOCAL_API_BASE,
 	ZOTERO_LOCAL_HOST,
 	authorizeLocal,
+	discoverLocalServerID,
 	getCachedLocalKey,
 	isConnectionError,
+	responseHeader,
 	resetLocalAuthCache,
+	setLocalServerID,
 } from "./localAuth.ts";
 
 /**
@@ -74,16 +77,13 @@ function baseHeaders(cfg: ZoteroConfig, extraKey?: string): Record<string, strin
 // Local API support: Zotero-Server-ID + library-version caches, 401/412 retries
 // ---------------------------------------------------------------------------
 
-/** X-Zotero-Server-ID of the local Zotero instance; echoed back on writes. */
-let localServerID: string | undefined;
 /** Last-Modified-Version of the last local data response = the library's clientVersion. */
 let localLibraryVersion: number | undefined;
 
 /** Reset process-level Local API state (caches + the authorize key). Exposed for tests. */
 export function resetZoteroLocalState(): void {
-	localServerID = undefined;
 	localLibraryVersion = undefined;
-	resetLocalAuthCache();
+	resetLocalAuthCache(); // also clears the Zotero-Server-ID cache
 }
 
 async function fetchWithConnError(
@@ -104,27 +104,6 @@ async function fetchWithConnError(
 	}
 }
 
-/**
- * Every Zotero response (even errors) carries X-Zotero-Server-ID. Reads may
- * omit it, writes must echo it (428 otherwise, 412 on mismatch). Learn it from
- * /api/ — errors there still carry the header. If it cannot be learned, writes
- * proceed without it and the 428 retry below picks it up from the error response.
- */
-async function ensureLocalServerID(signal?: AbortSignal): Promise<string | undefined> {
-	if (localServerID) return localServerID;
-	try {
-		const res = await fetchWithConnError(true, `${ZOTERO_LOCAL_API_BASE}/`, {
-			headers: { "Zotero-API-Version": "3" },
-			signal,
-		});
-		const sid = res.headers.get("X-Zotero-Server-ID");
-		if (sid) localServerID = sid;
-	} catch (err) {
-		if (!(err instanceof ZoteroError)) throw err; // connection errors: friendly message; ZoteroError: proceed without SID
-	}
-	return localServerID;
-}
-
 /** Multi-object POSTs (items/collections) validate If-Unmodified-Since-Version against the library version. */
 function isMultiObjectWrite(cfg: ZoteroConfig, path: string): boolean {
 	if (cfg.mode !== "local") return false;
@@ -141,7 +120,7 @@ function isMultiObjectWrite(cfg: ZoteroConfig, path: string): boolean {
 async function ensureLocalLibraryVersion(cfg: ZoteroConfig, signal?: AbortSignal): Promise<number> {
 	if (localLibraryVersion !== undefined) return localLibraryVersion;
 	const res = await zoteroFetch(cfg, `${prefix(cfg)}/items?limit=1&format=json`, { signal });
-	const v = Number.parseInt(res.headers.get("Last-Modified-Version") ?? "", 10);
+	const v = Number.parseInt((responseHeader(res, "Last-Modified-Version") ?? "") + "", 10);
 	if (!Number.isNaN(v)) localLibraryVersion = v;
 	return localLibraryVersion ?? 0;
 }
@@ -163,7 +142,7 @@ async function zoteroFetch(
 			init = { ...init, redirect: "manual" };
 		}
 		if (method !== "GET") {
-			const sid = await ensureLocalServerID(init.signal);
+			const sid = await discoverLocalServerID(init.signal);
 			if (sid) extraHeaders["Zotero-Server-ID"] = sid;
 			// A key acquired via the 401 → authorize retry supersedes the stored credential.
 			const key = getCachedLocalKey() ?? cfg.apiKey;
@@ -181,9 +160,9 @@ async function zoteroFetch(
 	if (isLocal) {
 		// Errors carry the current Server-ID too — a 412/428 retry therefore
 		// re-echoes the value captured here.
-		const sid = res.headers.get("X-Zotero-Server-ID");
-		if (sid) localServerID = sid;
-		const lmv = Number.parseInt(res.headers.get("Last-Modified-Version") ?? "", 10);
+		const sid = responseHeader(res, "Zotero-Server-ID");
+		if (sid) setLocalServerID(sid);
+		const lmv = Number.parseInt((responseHeader(res, "Last-Modified-Version") ?? "") + "", 10);
 		if (!Number.isNaN(lmv)) localLibraryVersion = lmv;
 	}
 	if (!res.ok && res.status !== 302) {
@@ -737,7 +716,7 @@ export async function downloadAttachmentFile(
 	if (res.status === 302) {
 		// Local Zotero answers with 302 → file://... (the stored attachment on
 		// disk); undici does not follow file:// redirects, so read it directly.
-		const location = res.headers.get("Location") ?? "";
+		const location = (responseHeader(res, "Location") ?? "") + "";
 		if (!location.startsWith("file:")) {
 			throw new ZoteroError(`Unexpected attachment redirect: ${location}`, res.status, "");
 		}
@@ -751,7 +730,7 @@ export async function downloadAttachmentFile(
 	await writeFile(opts.outputPath, buf);
 	return {
 		path: opts.outputPath,
-		md5: res.status === 302 ? createHash("md5").update(buf).digest("hex") : (res.headers.get("ETag") ?? undefined),
+		md5: res.status === 302 ? createHash("md5").update(buf).digest("hex") : (responseHeader(res, "ETag") ?? undefined),
 		bytes: buf.length,
 	};
 }
