@@ -1,13 +1,33 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { ZOTERO_API_BASE } from "./provider.ts";
+import {
+	ZOTERO_LOCAL_API_BASE,
+	ZOTERO_LOCAL_HOST,
+	authorizeLocal,
+	getCachedLocalKey,
+	isConnectionError,
+	resetLocalAuthCache,
+} from "./localAuth.ts";
 
-/** Resolved Zotero credentials used to authenticate Web API requests. */
+/**
+ * Resolved Zotero credentials used to authenticate API requests.
+ *
+ * `mode: "local"` talks to the desktop app's Local API
+ * (http://127.0.0.1:23119/api, Zotero 10+): reads are keyless; writes need a
+ * Zotero-Server-ID header plus a *local* API key, which is obtained lazily via
+ * /api/local/authorize (see the 401 retry in zoteroFetch) when the stored
+ * credential is missing or has been consumed.
+ */
 export interface ZoteroConfig {
-	apiKey: string;
-	/** Numeric user id for the personal library, resolved from /keys/current during login. */
-	userId: string;
+	/** API key. Required for the Web API; optional for the Local API. */
+	apiKey?: string;
+	/** Numeric user id for the personal library — needed only by the Web API. */
+	userId?: string;
+	/** Which Zotero API to talk to. Default (and legacy callers) is the Web API. */
+	mode?: "web" | "local";
 	/** Optional group library id. When set, group libraries are used instead of the personal library. */
 	groupId?: string;
 }
@@ -30,28 +50,164 @@ export class ZoteroError extends Error {
 	}
 }
 
+function apiBase(cfg: ZoteroConfig): string {
+	return cfg.mode === "local" ? ZOTERO_LOCAL_API_BASE : ZOTERO_API_BASE;
+}
+
 function prefix(cfg: ZoteroConfig): string {
+	if (cfg.mode === "local") {
+		// Locally, any userID addresses the logged-in user; 0 is the documented spelling.
+		return cfg.groupId ? `/groups/${cfg.groupId}` : `/users/0`;
+	}
 	return cfg.groupId ? `/groups/${cfg.groupId}` : `/users/${cfg.userId}`;
 }
 
-function baseHeaders(cfg: ZoteroConfig): Record<string, string> {
+function baseHeaders(cfg: ZoteroConfig, extraKey?: string): Record<string, string> {
+	const key = extraKey ?? cfg.apiKey;
 	return {
-		"Zotero-API-Key": cfg.apiKey,
 		"Zotero-API-Version": "3",
+		...(key ? { "Zotero-API-Key": key } : {}),
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Local API support: Zotero-Server-ID + library-version caches, 401/412 retries
+// ---------------------------------------------------------------------------
+
+/** X-Zotero-Server-ID of the local Zotero instance; echoed back on writes. */
+let localServerID: string | undefined;
+/** Last-Modified-Version of the last local data response = the library's clientVersion. */
+let localLibraryVersion: number | undefined;
+
+/** Reset process-level Local API state (caches + the authorize key). Exposed for tests. */
+export function resetZoteroLocalState(): void {
+	localServerID = undefined;
+	localLibraryVersion = undefined;
+	resetLocalAuthCache();
+}
+
+async function fetchWithConnError(
+	isLocal: boolean,
+	url: string,
+	init: RequestInit & { signal?: AbortSignal } = {},
+): Promise<Response> {
+	try {
+		return await fetch(url, init);
+	} catch (err) {
+		if (isLocal && isConnectionError(err)) {
+			throw new Error(
+				`Zotero does not appear to be running (no response from ${ZOTERO_LOCAL_HOST}). Start the Zotero desktop app and enable its local API ` +
+					`(Settings → Advanced → "Allow other applications on this computer to communicate with Zotero").`,
+			);
+		}
+		throw err;
+	}
+}
+
+/**
+ * Every Zotero response (even errors) carries X-Zotero-Server-ID. Reads may
+ * omit it, writes must echo it (428 otherwise, 412 on mismatch). Learn it from
+ * /api/ — errors there still carry the header. If it cannot be learned, writes
+ * proceed without it and the 428 retry below picks it up from the error response.
+ */
+async function ensureLocalServerID(signal?: AbortSignal): Promise<string | undefined> {
+	if (localServerID) return localServerID;
+	try {
+		const res = await fetchWithConnError(true, `${ZOTERO_LOCAL_API_BASE}/`, {
+			headers: { "Zotero-API-Version": "3" },
+			signal,
+		});
+		const sid = res.headers.get("X-Zotero-Server-ID");
+		if (sid) localServerID = sid;
+	} catch (err) {
+		if (!(err instanceof ZoteroError)) throw err; // connection errors: friendly message; ZoteroError: proceed without SID
+	}
+	return localServerID;
+}
+
+/** Multi-object POSTs (items/collections) validate If-Unmodified-Since-Version against the library version. */
+function isMultiObjectWrite(cfg: ZoteroConfig, path: string): boolean {
+	if (cfg.mode !== "local") return false;
+	const p = prefix(cfg);
+	return path === `${p}/items` || path === `${p}/collections`;
+}
+
+/**
+ * Library-level version for the If-Unmodified-Since-Version header of keyed
+ * writes. Any prior local data response refreshes the cache via its
+ * Last-Modified-Version header; a 412 clears it (see zoteroFetch) and the next
+ * call re-reads it with a fresh round-trip.
+ */
+async function ensureLocalLibraryVersion(cfg: ZoteroConfig, signal?: AbortSignal): Promise<number> {
+	if (localLibraryVersion !== undefined) return localLibraryVersion;
+	const res = await zoteroFetch(cfg, `${prefix(cfg)}/items?limit=1&format=json`, { signal });
+	const v = Number.parseInt(res.headers.get("Last-Modified-Version") ?? "", 10);
+	if (!Number.isNaN(v)) localLibraryVersion = v;
+	return localLibraryVersion ?? 0;
 }
 
 async function zoteroFetch(
 	cfg: ZoteroConfig,
 	path: string,
 	init: RequestInit & { signal?: AbortSignal } = {},
+	depth = 0,
 ): Promise<Response> {
-	const res = await fetch(`${ZOTERO_API_BASE}${path}`, {
+	const isLocal = cfg.mode === "local";
+	const method = (init.method ?? "GET").toUpperCase();
+	const extraHeaders: Record<string, string> = {};
+	let attachedLibraryVersion = false;
+	if (isLocal) {
+		// undici's fetch does not follow redirects to file:// URLs; the local
+		// GET /items/:key/file answers 302 → file://..., so follow it manually.
+		if (init.redirect === undefined && method === "GET") {
+			init = { ...init, redirect: "manual" };
+		}
+		if (method !== "GET") {
+			const sid = await ensureLocalServerID(init.signal);
+			if (sid) extraHeaders["Zotero-Server-ID"] = sid;
+			// A key acquired via the 401 → authorize retry supersedes the stored credential.
+			const key = getCachedLocalKey() ?? cfg.apiKey;
+			if (key) extraHeaders["Zotero-API-Key"] = key;
+			if (isMultiObjectWrite(cfg, path)) {
+				extraHeaders["If-Unmodified-Since-Version"] = String(await ensureLocalLibraryVersion(cfg, init.signal));
+				attachedLibraryVersion = true;
+			}
+		}
+	}
+	const res = await fetchWithConnError(isLocal, `${apiBase(cfg)}${path}`, {
 		...init,
-		headers: { ...baseHeaders(cfg), ...(init.headers ?? {}) },
+		headers: { ...baseHeaders(cfg, extraHeaders["Zotero-API-Key"]), ...extraHeaders, ...(init.headers ?? {}) },
 	});
-	if (!res.ok) {
+	if (isLocal) {
+		// Errors carry the current Server-ID too — a 412/428 retry therefore
+		// re-echoes the value captured here.
+		const sid = res.headers.get("X-Zotero-Server-ID");
+		if (sid) localServerID = sid;
+		const lmv = Number.parseInt(res.headers.get("Last-Modified-Version") ?? "", 10);
+		if (!Number.isNaN(lmv)) localLibraryVersion = lmv;
+	}
+	if (!res.ok && res.status !== 302) {
 		const body = await res.text().catch(() => "");
+		if (isLocal && method !== "GET" && depth < 2) {
+			if (res.status === 401) {
+				// Unknown/missing/consumed key: forget the stale one, run the
+				// authorize handshake (shows the consent dialog in Zotero) and retry.
+				resetLocalAuthCache();
+				await authorizeLocal(init.signal);
+				return zoteroFetch(cfg, path, init, depth + 1);
+			}
+			if (res.status === 412 || res.status === 428) {
+				if (body.includes("Zotero-Server-ID")) {
+					// New (or absent-then-learned) Server-ID was captured above; retry.
+					return zoteroFetch(cfg, path, init, depth + 1);
+				}
+				if (attachedLibraryVersion && body.includes("Library has been modified")) {
+					// Our library-level If-Unmodified-Since-Version was stale; re-read it.
+					localLibraryVersion = undefined;
+					return zoteroFetch(cfg, path, init, depth + 1);
+				}
+			}
+		}
 		throw new ZoteroError(`Zotero API request to ${path} failed`, res.status, body);
 	}
 	return res;
@@ -119,14 +275,27 @@ export async function getChildren(
 	return (await res.json()) as ZoteroItem[];
 }
 
-/** Fetch an item template for a given itemType (helps build create/update payloads). */
+/**
+ * Fetch an item template for a given itemType (helps build create/update payloads).
+ * In local mode, /items/new (a Web-API-only endpoint) 404s, so we fall back to
+ * the public Web API — the template is constant, authoritative, and keyless.
+ */
 export async function itemTemplate(
 	itemType: string,
 	linkMode?: string,
 	signal?: AbortSignal,
+	cfg?: ZoteroConfig,
 ): Promise<Record<string, unknown>> {
 	const q = new URLSearchParams({ itemType });
 	if (linkMode) q.set("linkMode", linkMode);
+	if (cfg?.mode === "local") {
+		try {
+			const res = await zoteroFetch(cfg, `/items/new?${q.toString()}`, { signal });
+			return (await res.json()) as Record<string, unknown>;
+		} catch (err) {
+			if (!(err instanceof ZoteroError) || err.status !== 404) throw err;
+		}
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/items/new?${q.toString()}`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to fetch item template", res.status, await res.text());
 	return (await res.json()) as Record<string, unknown>;
@@ -564,9 +733,27 @@ export async function downloadAttachmentFile(
 ): Promise<{ path: string; md5?: string; bytes: number }> {
 	const { writeFile } = await import("node:fs/promises");
 	const res = await zoteroFetch(cfg, `${prefix(cfg)}/items/${opts.itemKey}/file`, { signal });
-	const buf = Buffer.from(await res.arrayBuffer());
+	let buf: Buffer;
+	if (res.status === 302) {
+		// Local Zotero answers with 302 → file://... (the stored attachment on
+		// disk); undici does not follow file:// redirects, so read it directly.
+		const location = res.headers.get("Location") ?? "";
+		if (!location.startsWith("file:")) {
+			throw new ZoteroError(`Unexpected attachment redirect: ${location}`, res.status, "");
+		}
+		buf = Buffer.from(await readFile(fileURLToPath(location)));
+	} else {
+		if (!res.ok) {
+			throw new ZoteroError("Failed to download attachment", res.status, await res.text().catch(() => ""));
+		}
+		buf = Buffer.from(await res.arrayBuffer());
+	}
 	await writeFile(opts.outputPath, buf);
-	return { path: opts.outputPath, md5: res.headers.get("ETag") ?? undefined, bytes: buf.length };
+	return {
+		path: opts.outputPath,
+		md5: res.status === 302 ? createHash("md5").update(buf).digest("hex") : (res.headers.get("ETag") ?? undefined),
+		bytes: buf.length,
+	};
 }
 
 // -----------------------------------------------------------------------------
@@ -582,8 +769,13 @@ export interface NameLocalized {
 
 /** GET /itemTypes — all item types with localized names. */
 export async function listItemTypes(
+	cfg?: ZoteroConfig,
 	signal?: AbortSignal,
 ): Promise<Array<{ itemType: string; localized: string }>> {
+	if (cfg?.mode === "local") {
+		const res = await zoteroFetch(cfg, "/itemTypes", { signal });
+		return (await res.json()) as Array<{ itemType: string; localized: string }>;
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/itemTypes`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to list item types", res.status, await res.text());
 	return (await res.json()) as Array<{ itemType: string; localized: string }>;
@@ -591,8 +783,13 @@ export async function listItemTypes(
 
 /** GET /itemFields — all item fields with localized names. */
 export async function listItemFields(
+	cfg?: ZoteroConfig,
 	signal?: AbortSignal,
 ): Promise<Array<{ field: string; localized: string }>> {
+	if (cfg?.mode === "local") {
+		const res = await zoteroFetch(cfg, "/itemFields", { signal });
+		return (await res.json()) as Array<{ field: string; localized: string }>;
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/itemFields`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to list item fields", res.status, await res.text());
 	return (await res.json()) as Array<{ field: string; localized: string }>;
@@ -601,9 +798,14 @@ export async function listItemFields(
 /** GET /itemTypeFields?itemType=... — valid fields for an item type. */
 export async function listItemTypeFields(
 	itemType: string,
+	cfg?: ZoteroConfig,
 	signal?: AbortSignal,
 ): Promise<Array<{ field: string; localized: string }>> {
 	const q = new URLSearchParams({ itemType });
+	if (cfg?.mode === "local") {
+		const res = await zoteroFetch(cfg, `/itemTypeFields?${q.toString()}`, { signal });
+		return (await res.json()) as Array<{ field: string; localized: string }>;
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/itemTypeFields?${q.toString()}`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to list fields for item type", res.status, await res.text());
 	return (await res.json()) as Array<{ field: string; localized: string }>;
@@ -612,9 +814,14 @@ export async function listItemTypeFields(
 /** GET /itemTypeCreatorTypes?itemType=... — valid creator types for an item type. */
 export async function listCreatorTypes(
 	itemType: string,
+	cfg?: ZoteroConfig,
 	signal?: AbortSignal,
 ): Promise<Array<{ creatorType: string; localized: string }>> {
 	const q = new URLSearchParams({ itemType });
+	if (cfg?.mode === "local") {
+		const res = await zoteroFetch(cfg, `/itemTypeCreatorTypes?${q.toString()}`, { signal });
+		return (await res.json()) as Array<{ creatorType: string; localized: string }>;
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/itemTypeCreatorTypes?${q.toString()}`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to list creator types", res.status, await res.text());
 	return (await res.json()) as Array<{ creatorType: string; localized: string }>;
@@ -622,8 +829,13 @@ export async function listCreatorTypes(
 
 /** GET /creatorFields — localized creator field names (firstName/lastName/name). */
 export async function listCreatorFields(
+	cfg?: ZoteroConfig,
 	signal?: AbortSignal,
 ): Promise<Array<{ field: string; localized: string }>> {
+	if (cfg?.mode === "local") {
+		const res = await zoteroFetch(cfg, "/creatorFields", { signal });
+		return (await res.json()) as Array<{ field: string; localized: string }>;
+	}
 	const res = await fetch(`${ZOTERO_API_BASE}/creatorFields`, { signal });
 	if (!res.ok) throw new ZoteroError("Failed to list creator fields", res.status, await res.text());
 	return (await res.json()) as Array<{ field: string; localized: string }>;

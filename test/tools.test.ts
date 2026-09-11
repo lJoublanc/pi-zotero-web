@@ -17,8 +17,10 @@ function harness() {
 
 	function ctx(auth: unknown): ExtensionContext {
 		return {
+			cwd: process.cwd(),
+			isProjectTrusted: () => true,
 			modelRegistry: {
-				getProviderAuth: async () => auth,
+				getProviderAuth: async (providerId: string) => (providerId === "zotero" ? auth : undefined),
 			},
 		} as unknown as ExtensionContext;
 	}
@@ -45,12 +47,16 @@ describe("tools.zotero_search", () => {
 		handle.restore();
 	});
 
-	it("throws a helpful error when no key is configured", async () => {
+	it("falls back to the Local API read-only when no credentials are stored", async () => {
 		const { tools, ctx } = harness();
-		await assert.rejects(
-			() => tools.get("zotero_search")!.execute("id", { q: "x" }, undefined, undefined, ctx(NO_AUTH)),
-			/\/login zotero/,
+		const handle = mockFetch((c) =>
+			c.url.startsWith("http://127.0.0.1:23119/api/users/0/items?") ? { status: 200, body: [] } : undefined,
 		);
+		const res = await tools.get("zotero_search")!.execute("id", { q: "x" }, undefined, undefined, ctx(NO_AUTH));
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed.count, 0);
+		assert.match(handle.calls[0]!.url, /127\.0\.0\.1:23119\/api\/users\/0\/items/);
+		handle.restore();
 	});
 });
 
@@ -276,11 +282,13 @@ describe("tools.zotero_item", () => {
 });
 
 describe("tools.zotero_template", () => {
-	it("returns the template (no auth required)", async () => {
+	it("returns the template (no auth; local /items/new 404s -> Web API)", async () => {
 		const { tools, ctx } = harness();
-		const handle = mockFetch((c) =>
-			c.url.startsWith("https://api.zotero.org/items/new?") ? { status: 200, body: { itemType: "note" } } : undefined,
-		);
+		const handle = mockFetch((c) => {
+			if (c.url === "http://127.0.0.1:23119/api/items/new?itemType=note") return { status: 404, body: "Not found" };
+			if (c.url.startsWith("https://api.zotero.org/items/new?")) return { status: 200, body: { itemType: "note" } };
+			return undefined;
+		});
 		const res = await tools.get("zotero_template")!.execute("id", { itemType: "note" }, undefined, undefined, ctx(NO_AUTH));
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
 		assert.equal(parsed.itemType, "note");
@@ -498,10 +506,10 @@ describe("tools.zotero_export", () => {
 });
 
 describe("tools.zotero_schema", () => {
-	it("itemTypes returns the list without auth", async () => {
+	it("itemTypes reads from the Local API without auth in read-only mode", async () => {
 		const { tools, ctx } = harness();
 		const handle = mockFetch((c) =>
-			c.url === "https://api.zotero.org/itemTypes" ? { status: 200, body: [{ itemType: "book", localized: "Book" }] } : undefined,
+			c.url === "http://127.0.0.1:23119/api/itemTypes" ? { status: 200, body: [{ itemType: "book", localized: "Book" }] } : undefined,
 		);
 		const res = await tools.get("zotero_schema")!.execute("id", { action: "itemTypes" }, undefined, undefined, ctx(NO_AUTH));
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);

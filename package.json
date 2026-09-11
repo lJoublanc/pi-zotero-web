@@ -1,7 +1,7 @@
 {
   "name": "pi-zotero-web",
-  "version": "0.2.2",
-  "description": "Zotero Web API integration for pi: CRUD on items + PDFs, library search, tags & collections, citation export, full-text, duplicate detection on create, and /login zotero key management.",
+  "version": "0.3.0",
+  "description": "Zotero integration for pi: CRUD on items + PDFs, library search, tags & collections, citation export, full-text, duplicate detection on create, and /login key management. Talks to the Zotero Web API or the Local API of the running desktop app (auto-detected, `zotero.mode` setting to override).",
   "type": "module",
   "main": "./index.ts",
   "keywords": [
@@ -25,8 +25,8 @@
     ]
   },
   "scripts": {
-    "test": "node --import tsx --test test/*.test.ts",
-    "check": "node --import tsx --test test/*.test.ts",
+    "test": "node --experimental-transform-types --test test/*.test.ts",
+    "check": "node --experimental-transform-types --test test/*.test.ts",
     "prepublishOnly": "npm test"
   },
   "peerDependencies": {
@@ -34,16 +34,16 @@
     "@earendil-works/pi-ai": "*",
     "typebox": "*"
   },
-  "devDependencies": {
-    "tsx": "^4.23.0"
-  },
+  "devDependencies": {},
   "engines": {
-    "node": ">=20"
+    "node": ">=22.7"
   },
   "files": [
     "index.ts",
     "provider.ts",
     "client.ts",
+    "localAuth.ts",
+    "mode.ts",
     "tools.ts",
     "README.md",
     "package.json"

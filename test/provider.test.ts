@@ -1,9 +1,10 @@
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { ZOTERO_PROVIDER_ID, createZoteroProvider, fetchKeyInfo } from "../provider.ts";
+import { ZOTERO_PROVIDER_ID, createZoteroLocalProvider, createZoteroProvider, fetchKeyInfo } from "../provider.ts";
 import type { ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { mockFetch } from "./_mock.ts";
+import { resetLocalAuthCache } from "../localAuth.ts";
 
 describe("provider.fetchKeyInfo", () => {
 	it("returns the parsed key info on 200", async () => {
@@ -162,5 +163,42 @@ describe("provider shape", () => {
 		assert.equal(provider.id, ZOTERO_PROVIDER_ID);
 		assert.equal(provider.name, "Zotero");
 		assert.deepEqual(provider.getModels(), []);
+	});
+});
+describe("provider.createZoteroLocalProvider", () => {
+	beforeEach(() => {
+		resetLocalAuthCache();
+	});
+
+	it("login obtains a key via the /api/local/authorize handshake", async () => {
+		const handle = mockFetch((c) =>
+			c.method === "POST" && c.url === "http://127.0.0.1:23119/api/local/authorize"
+				? { status: 200, body: { key: "LOK123", remember: true } }
+				: undefined,
+		);
+		const cred = await createZoteroLocalProvider().auth!.apiKey!.login!(fakeInteraction("x"));
+		assert.equal((cred as { key?: string }).key, "LOK123");
+		const call = handle.calls[0]!;
+		assert.deepEqual(JSON.parse(call.body as string), { appName: "pi" });
+		handle.restore();
+	});
+
+	it("surfaces the denied dialog as an error mentioning the Zotero window", async () => {
+		const handle = mockFetch(() => ({ status: 403, body: { denied: true } }));
+		await assert.rejects(
+			() => createZoteroLocalProvider().auth!.apiKey!.login!(fakeInteraction("x")),
+			/Allow/,
+		);
+		assert.equal(handle.calls.length, 3); // 3 attempts, then the helpful error
+		handle.restore();
+	});
+
+	it("gives a friendly error when Zotero is not running", async () => {
+		const handle = mockFetch(() => undefined); // every fetch throws: connection failure
+		await assert.rejects(
+			() => createZoteroLocalProvider().auth!.apiKey!.login!(fakeInteraction("x")),
+			/does not appear to be running/,
+		);
+		handle.restore();
 	});
 });

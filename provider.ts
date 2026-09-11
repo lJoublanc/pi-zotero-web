@@ -12,9 +12,14 @@ import type {
 import type { ApiKeyCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
+import { authorizeLocal, LocalAuthError, ZOTERO_LOCAL_API_BASE } from "./localAuth.ts";
+
 /** Provider id used for `/login zotero`, `/logout zotero`, and credential storage in auth.json. */
 export const ZOTERO_PROVIDER_ID = "zotero";
 export const ZOTERO_API_BASE = "https://api.zotero.org";
+
+/** Provider id for the Local API variant (`/login zotero-local`). */
+export const ZOTERO_LOCAL_PROVIDER_ID = "zotero-local";
 
 interface KeyInfo {
 	userID: number;
@@ -48,6 +53,69 @@ export class KeyCheckError extends Error {
 		);
 		this.name = "KeyCheckError";
 	}
+}
+
+/**
+ * A second auth-only provider backed by the Zotero *Local* API
+ * (http://127.0.0.1:23119/api, Zotero 10+). `/login zotero-local` runs the
+ * Local-API authorization handshake: it pops the Allow / Always Allow / Deny
+ * dialog in the running Zotero desktop app and stores the returned key.
+ * No key verification round-trip is needed (unlike the Web API's
+ * /keys/current) because reads work keyless and the handshake itself verifies
+ * the desktop app is present and grants access.
+ */
+export function createZoteroLocalProvider(): Provider<Api> {
+	return {
+		id: ZOTERO_LOCAL_PROVIDER_ID,
+		name: "Zotero Local",
+		baseUrl: ZOTERO_LOCAL_API_BASE,
+		auth: {
+			apiKey: {
+				name: "Zotero local API key",
+				async login(interaction: ProviderAuthInteraction): Promise<ApiKeyCredential> {
+					let lastError: Error | undefined;
+					for (let attempt = 1; attempt <= 3; attempt++) {
+						interaction.notify({
+							type: "progress",
+							message: `Ask Zotero for a local API key — check the Zotero window and Allow access… (attempt ${attempt})`,
+						});
+						try {
+							const key = await authorizeLocal(interaction.signal);
+							interaction.notify({ type: "progress", message: "Zotero granted access; storing the key in ~/.pi/agent/auth.json…" });
+							return { type: "api_key", key, env: {} };
+						} catch (err) {
+							lastError = err as Error;
+							// Nothing dialog-related can change without user action; don't spin.
+							if (err instanceof LocalAuthError && (err.status === 404 || err.status === 429)) throw err;
+							interaction.notify({ type: "info", message: lastError.message });
+						}
+					}
+					throw lastError ?? new Error(
+						`Zotero did not grant a local API key. Make sure the Zotero desktop app is running and that ` +
+							`"Allow other applications on this computer to communicate with Zotero" is checked (Settings → Advanced), ` +
+							`then run /login zotero-local again.`,
+					);
+				},
+				async check({ credential }): Promise<AuthCheck | undefined> {
+					return credential?.key ? { type: "api_key", source: "stored credential" } : undefined;
+				},
+				async resolve({ credential }): Promise<AuthResult | undefined> {
+					const key = credential?.key;
+					if (!key) return undefined;
+					return {
+						auth: { apiKey: key },
+						env: credential?.env,
+						source: "stored Zotero local API key",
+					};
+				},
+			},
+		},
+		getModels: () => [],
+		stream: <T extends Api>(_model: Model<T>, _context: Context, _options?: ApiStreamOptions<T>) =>
+			unsupportedStream(),
+		streamSimple: (_model: Model<Api>, _context: Context, _options?: SimpleStreamOptions) =>
+			unsupportedStream(),
+	};
 }
 
 function unsupportedStream(): AssistantMessageEventStream {

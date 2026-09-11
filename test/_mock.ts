@@ -51,13 +51,17 @@ export function mockFetch(matcher: Matcher): { restore: () => void; calls: Fetch
 		calls.push(call);
 		const res = matcher(call);
 		if (!res) throw new Error(`Unexpected fetch: ${method} ${url}`);
+		const responseHeaders = new Headers(res.headers ?? {});
+		// 204/205/304 (and 101) forbid a response body in undici's Response constructor.
+		if ([101, 204, 205, 304].includes(res.status)) {
+			return new Response(null, { status: res.status, headers: responseHeaders });
+		}
 		const bodyBytes =
 			typeof res.body === "string"
 				? new TextEncoder().encode(res.body)
 				: res.body instanceof Buffer
 					? new Uint8Array(res.body)
 					: new TextEncoder().encode(JSON.stringify(res.body));
-		const responseHeaders = new Headers(res.headers ?? {});
 		return new Response(bodyBytes, { status: res.status, headers: responseHeaders });
 	};
 	globalThis.fetch = handler as typeof fetch;

@@ -2,7 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-import { ZOTERO_PROVIDER_ID } from "./provider.ts";
+import { ZOTERO_LOCAL_PROVIDER_ID, ZOTERO_PROVIDER_ID } from "./provider.ts";
+import { credentialOfAuth, readZoteroModeSetting, resolveZoteroMode } from "./mode.ts";
 import {
 	type ZoteroConfig,
 	type ZoteroItem,
@@ -35,26 +36,34 @@ import {
 	createItems,
 } from "./client.ts";
 
-/** Resolve the stored Zotero credential into a config, or throw a helpful error. */
+/**
+ * Resolve the configured Zotero target into a config: the `zotero.mode` setting
+ * (see mode.ts) picks between the stored Web (`/login zotero`) and Local
+ * (`/login zotero-local`) credentials; with no credentials at all, the Local
+ * API is used read-only.
+ */
 async function resolveConfig(ctx: ExtensionContext): Promise<ZoteroConfig> {
-	const auth = await ctx.modelRegistry.getProviderAuth(ZOTERO_PROVIDER_ID);
-	const apiKey = auth?.auth.apiKey;
-	if (!apiKey) {
-		throw new Error(
-			"No Zotero API key configured. Run `/login zotero` to set one (it is stored in ~/.pi/agent/auth.json).",
-		);
+	const [webAuth, localAuth] = await Promise.all([
+		ctx.modelRegistry.getProviderAuth(ZOTERO_PROVIDER_ID),
+		ctx.modelRegistry.getProviderAuth(ZOTERO_LOCAL_PROVIDER_ID),
+	]);
+	const resolved = resolveZoteroMode(credentialOfAuth(webAuth), credentialOfAuth(localAuth), readZoteroModeSetting(ctx));
+	if (resolved.mode === "web") {
+		const apiKey = credentialOfAuth(webAuth)?.key;
+		if (!apiKey) {
+			throw new Error(
+				'No Zotero credentials configured for Web API mode. Run `/login zotero` (Web) or `/login zotero-local` (Local), ' +
+					'or set `"zotero": { "mode": "local" }` in ~/.pi/agent/settings.json.',
+				);
+		}
+		const userId = (webAuth as { env?: Record<string, string | undefined> } | null | undefined)?.env?.ZOTERO_USER_ID;
+		if (!userId) {
+			throw new Error("Zotero API key is stored but no user id was found. Re-run `/login zotero` to refresh it.");
+		}
+		return { mode: "web", apiKey, userId, groupId: resolved.groupId };
 	}
-	const userId = auth?.env?.ZOTERO_USER_ID;
-	if (!userId) {
-		throw new Error(
-			"Zotero API key is stored but no user id was found. Re-run `/login zotero` to refresh it.",
-		);
-	}
-	const cfg: ZoteroConfig = { apiKey, userId };
-	// Group library override via provider-scoped env (set manually in auth.json if needed).
-	const groupId = auth.env?.ZOTERO_GROUP_ID;
-	if (typeof groupId === "string" && groupId) cfg.groupId = groupId;
-	return cfg;
+	// Local mode: reads are keyless; writes obtain a local key lazily (401 → /api/local/authorize).
+	return { mode: "local", apiKey: resolved.apiKey, userId: "0", groupId: resolved.groupId };
 }
 
 function summarize(items: ZoteroItem[]): unknown[] {
@@ -304,8 +313,9 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				Type.String({ description: "For itemType=attachment: imported_file, imported_url, linked_file, linked_url." }),
 			),
 		}),
-		async execute(_id, params, signal) {
-			const template = await itemTemplate(params.itemType, params.linkMode, signal);
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const cfg = await resolveConfig(ctx);
+			const template = await itemTemplate(params.itemType, params.linkMode, signal, cfg);
 			return textResult(template);
 		},
 	});
@@ -598,7 +608,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 			"Read-only access to Zotero's item-type schema so the agent can construct valid create/update payloads. " +
 			"Actions: 'itemTypes' (all item types), 'itemFields' (all fields), 'itemTypeFields' (valid fields for one itemType — requires itemType), " +
 			"'creatorTypes' (valid creator types for one itemType — requires itemType), 'creatorFields' (localized firstName/lastName/name). " +
-			"No auth required (public endpoints). Use zotero_template for a ready-to-fill item, and this for discovering valid fields/creators for exotic types.",
+			"No key needed (public Web-API endpoints; served locally by the Local API when in local mode). Use zotero_template for a ready-to-fill item, and this for discovering valid fields/creators for exotic types.",
 		promptSnippet: "Look up valid Zotero item types, fields, and creator types.",
 		parameters: Type.Object({
 			action: StringEnum(["itemTypes", "itemFields", "itemTypeFields", "creatorTypes", "creatorFields"] as const, {
@@ -608,22 +618,23 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				Type.String({ description: "Required for itemTypeFields and creatorTypes (e.g. journalArticle, book)." }),
 			),
 		}),
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const cfg = await resolveConfig(ctx);
 			switch (params.action) {
 				case "itemTypes":
-					return textResult(await listItemTypes(signal));
+					return textResult(await listItemTypes(cfg, signal));
 				case "itemFields":
-					return textResult(await listItemFields(signal));
+					return textResult(await listItemFields(cfg, signal));
 				case "itemTypeFields": {
 					if (!params.itemType) throw new Error("itemType is required for itemTypeFields.");
-					return textResult(await listItemTypeFields(params.itemType, signal));
+					return textResult(await listItemTypeFields(params.itemType, cfg, signal));
 				}
 				case "creatorTypes": {
 					if (!params.itemType) throw new Error("itemType is required for creatorTypes.");
-					return textResult(await listCreatorTypes(params.itemType, signal));
+					return textResult(await listCreatorTypes(params.itemType, cfg, signal));
 				}
 				case "creatorFields":
-					return textResult(await listCreatorFields(signal));
+					return textResult(await listCreatorFields(cfg, signal));
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
 			}

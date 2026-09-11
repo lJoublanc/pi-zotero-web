@@ -1,6 +1,10 @@
 # pi-zotero-web
 
-Zotero integration for [pi](https://pi.dev) via the Zotero Web API.
+Zotero integration for [pi](https://pi.dev) via the Zotero **Web API**
+(api.zotero.org) or the **Local API** of the running Zotero desktop app
+(`http://127.0.0.1:23119/api`, Zotero 10+). The mode is picked automatically
+from the stored credentials (see *Web or Local?* below); `"zotero": { "mode": ... }`
+in settings.json overrides it.
 
 - **CRUD on paper metadata + PDFs** — create, read, update, delete items and attachments; upload/download PDF files (full 4-step Zotero file upload flow).
 - **Library search** — keyword, title/author/year, and full-text (`qmode=everything`) search.
@@ -11,8 +15,30 @@ Zotero integration for [pi](https://pi.dev) via the Zotero Web API.
 
 ## Requirements
 
-- A Zotero account with a **personal library**.
-- A Zotero API key created at <https://www.zotero.org/settings/keys> with **Allow library access** and **Allow file access** (write access is needed for create/update/delete/upload).
+- **Web mode:** a Zotero account and an API key created at <https://www.zotero.org/settings/keys> with **Allow library access** and **Allow file access** (write access is needed for create/update/delete/upload).
+- **Local mode:** the Zotero 10+ desktop app running, with the Local API enabled: *Settings → Advanced → "Allow other applications on this computer to communicate with Zotero"*. Reads need nothing else; the first write pops an Allow / Always Allow / Deny dialog in Zotero (**pick "Always Allow"**, otherwise each key is single-use and every write re-prompts).
+
+## Web or Local?
+
+Mode resolution (in `mode.ts`), in order:
+
+| Stored credentials | `"zotero".mode` setting | Effective mode |
+|---|---|---|
+| none | (any) | **Local, read-only** — the Local API needs no key for reads; writes obtain a key via the Zotero consent dialog |
+| `zotero` (Web) | auto/unset | Web |
+| `zotero-local` (Local) | auto/unset | Local |
+| both | auto/unset | **Local** — a Web key never expires, so it would otherwise shadow a deliberately-earned local credential forever |
+| any | `"web"` / `"local"` | forced |
+
+Store `"zotero": { "mode": "local" }` (or `"web"`) in `~/.pi/agent/settings.json`, or trust-override it per project in `.pi/settings.json`. Settings are read-only from the extension's side: you edit them, the extension never writes them.
+
+Local-mode differences worth knowing:
+
+- Reads (search/collections/tags/full-text/schema) work with no key and no network; the Web-API-only `zotero_template` endpoint transparently falls back to the public Web API.
+- Writes add a `Zotero-Server-ID` header (learned from any prior response) and, for keyed multi-object creates, an `If-Unmodified-Since-Version` derived from the last read; stale values are re-read automatically on 412.
+- A 401 (missing/consumed key) triggers the `/api/local/authorize` handshake and retries once. To avoid dialogs on every single-use key, run `/login zotero-local` and choose **Always Allow**.
+- Attachment downloads follow the local 302 → `file://` redirect directly.
+- Group libraries: add `"env": { "ZOTERO_GROUP_ID": "<id>" }` to the stored credential in `~/.pi/agent/auth.json` (same as Web mode).
 
 ## Install
 
@@ -34,7 +60,12 @@ pi -e ./index.ts
 
 ## Configure
 
-Run `/login zotero` and paste your Zotero API key. It is verified against `/keys/current` and stored (with your user id) in `~/.pi/agent/auth.json`:
+Two credentials can be stored, each via its own `/login`:
+
+- `/login zotero` — the Web API key. Verified against `/keys/current` and stored (with your user id) in `~/.pi/agent/auth.json`:
+- `/login zotero-local` — the Local API key. Pops the Allow / Always Allow dialog in the running Zotero desktop app and stores the granted key (choose **Always Allow**).
+
+The Web login stores:
 
 ```jsonc
 {
@@ -95,19 +126,28 @@ Make an uploaded PDF searchable headlessly:
 
 ## Testing
 
-Unit tests use Node's built-in test runner with a mocked `fetch` (no real network):
+Unit tests use Node's built-in test runner (with `--experimental-transform-types`; Node ≥ 22.7) and a mocked `fetch` (no real network):
 
 ```bash
 npm test
 ```
 
-The pi host packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox`) are provided by pi at runtime. For tests, they're symlinked into `node_modules/@earendil-works*` from the global pi install. If you move this checkout, re-create those symlinks (or `npm install` a local pi-coding-agent).
+The pi host packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox`) are provided by pi at runtime. For tests, they're symlinked into `node_modules/` from the global pi install. If you move this checkout, re-create those symlinks:
+
+```bash
+PI_TRIPLE=$(dirname $(readlink -f $(which pi)))/..
+mkdir -p node_modules/@earendil-works
+ln -sfn $PI_TRIPLE/@earendil-works/pi-coding-agent node_modules/@earendil-works/pi-coding-agent
+ln -sfn $PI_TRIPLE/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai node_modules/@earendil-works/pi-ai
+ln -sfn $PI_TRIPLE/@earendil-works/pi-coding-agent/node_modules/typebox node_modules/typebox
+```
 
 ## How it works
 
-- `provider.ts` registers a native pi-ai `Provider` named `zotero` that declares **no LLM models** (so it never appears in `/model`). Its only purpose is authentication: `/login zotero` runs the provider's `apiKey.login` flow, which verifies the key and stores it.
-- Tools read the stored credential via `ctx.modelRegistry.getProviderAuth("zotero")` and call the Zotero Web API (`https://api.zotero.org`) with the `Zotero-API-Key` header.
-- File upload implements Zotero's full 4-step flow (create attachment item → upload authorization → S3 `prefix+file+suffix` POST → register upload).
+- `provider.ts` registers two native pi-ai `Provider`s — `zotero` (Web) and `zotero-local` (Local) — that declare **no LLM models** (so they never appear in `/model`). Their only purpose is authentication: `/login zotero` verifies the key via `/keys/current`; `/login zotero-local` runs the Local-API `/api/local/authorize` handshake (the consent dialog lives in Zotero).
+- `mode.ts` resolves the effective mode: the `zotero.mode` setting over the stored credentials (local wins when both are stored; no credentials → keyless local read-only). Settings are read via `SettingsManager` (global + trusted project, shallow-merged, project wins) — the extension never writes them.
+- Tools read the resolved credential via `ctx.modelRegistry.getProviderAuth("zotero" | "zotero-local")`. Web requests go to `https://api.zotero.org` with the `Zotero-API-Key` header; local requests go to `http://127.0.0.1:23119/api`, keyless for reads, and for writes add `Zotero-Server-ID`, the local key (401 → `/api/local/authorize` → single retry), and, for keyed multi-object creates, `If-Unmodified-Since-Version` (refreshed on 412).
+- File upload implements Zotero's full 4-step flow (create attachment item → upload authorization → S3 — or, locally, `/api/local/uploads/:key` — `prefix+file+suffix` POST → register upload); downloads follow the local 302 → `file://` redirect by reading the target path directly.
 
 ## License
 

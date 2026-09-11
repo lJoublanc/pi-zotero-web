@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,7 +6,9 @@ import { join } from "node:path";
 
 import {
 	type SearchParams,
+	type ZoteroConfig,
 	ZoteroError,
+	resetZoteroLocalState,
 	addItemsToCollection,
 	createCollections,
 	createItems,
@@ -36,6 +38,8 @@ import {
 	getFullText,
 } from "../client.ts";
 import { assertHeader, mockFetch, type FetchCall } from "./_mock.ts";
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const CFG = { apiKey: "KEY123", userId: "42" };
 const GROUP_CFG = { apiKey: "KEY123", userId: "42", groupId: "7" };
@@ -526,6 +530,171 @@ describe("client full text", () => {
 		const body = JSON.parse(call!.body as string);
 		assert.equal(body.content, "txt");
 		assert.equal(body.indexedChars, 3);
+		handle.restore();
+	});
+});
+describe("client local mode", () => {
+	const LOCAL_CFG: ZoteroConfig = { mode: "local", apiKey: "STORED", userId: "0" };
+
+	beforeEach(() => {
+		resetZoteroLocalState();
+	});
+
+	it("reads go to 127.0.0.1:23119/api/users/0 without a Server-ID", async () => {
+		const handle = mockFetch((c) =>
+			c.url === "http://127.0.0.1:23119/api/users/0/items?format=json" ? { status: 200, body: [] } : undefined,
+		);
+		const items = await searchItems(LOCAL_CFG, {});
+		assert.equal(items.length, 0);
+		const call = handle.calls[0]!;
+		assert.match(call.url, /127\.0\.0\.1:23119\/api\/users\/0\/items/);
+		assert.equal(call.headers["zotero-server-id"], undefined);
+		handle.restore();
+	});
+
+	it("writes discover the Zotero-Server-ID first and echo it", async () => {
+		const handle = mockFetch((c) => {
+			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
+				return { status: 200, body: "Nothing to see here.", headers: { "X-Zotero-Server-ID": "SID123" } };
+			}
+			if (c.method === "PATCH" && c.url === "http://127.0.0.1:23119/api/users/0/items/K") return { status: 204, body: "" };
+			return undefined;
+		});
+		await updateItem(LOCAL_CFG, "K", 7, { title: "n" });
+		const [root, patch] = handle.calls;
+		assert.equal(root!.headers["zotero-server-id"], undefined); // discovery itself sends none
+		assert.equal(patch!.headers["zotero-server-id"], "SID123");
+		assert.equal(patch!.headers["if-unmodified-since-version"], "7");
+		handle.restore();
+	});
+
+	it("retries a 401 write via /api/local/authorize and uses the fresh key", async () => {
+		const handle = mockFetch((c) => {
+			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
+				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+			}
+			if (c.method === "PATCH" && c.url.endsWith("/users/0/items/K")) {
+				// note: _mock pushes the current call *before* the matcher runs, so the
+				// first PATCH already counts itself: 1 = first (401), 2 = retry (204)
+				const attempted = handle.calls.filter((x) => x.method === "PATCH").length;
+				return attempted === 1
+					? { status: 401, body: "API key required -- POST /api/local/authorize to obtain one", headers: { "WWW-Authenticate": 'Zotero-API-Key realm="Zotero Local API"' } }
+					: { status: 204, body: "" };
+			}
+			if (c.method === "POST" && c.url === "http://127.0.0.1:23119/api/local/authorize") {
+				return { status: 200, body: { key: "FRESHKEY", remember: true } };
+			}
+			return undefined;
+		});
+		await updateItem(LOCAL_CFG, "K", 7, { title: "n" });
+		const patches = handle.calls.filter((x) => x.method === "PATCH");
+		assert.equal(patches.length, 2);
+		assert.equal(patches[0]!.headers["zotero-api-key"], "STORED");
+		assert.equal(patches[1]!.headers["zotero-api-key"], "FRESHKEY");
+		const authorize = handle.calls.find((x) => x.method === "POST" && x.url.includes("/local/authorize"));
+		assert.deepEqual(JSON.parse(authorize!.body as string), { appName: "pi" });
+		handle.restore();
+	});
+
+	it("surfaces real 412 version conflicts without retrying", async () => {
+		const handle = mockFetch((c) => {
+			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
+				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+			}
+			if (c.method === "PATCH" && c.url.endsWith("/users/0/items/K")) {
+				return { status: 412, body: "item has been modified since specified version (expected 7, found 9)" };
+			}
+			return undefined;
+		});
+		await assert.rejects(
+			() => updateItem(LOCAL_CFG, "K", 7, { title: "n" }),
+			(err: unknown) => {
+				const z = err as ZoteroError;
+				return z.status === 412 && /item has been modified/.test(z.body);
+			},
+		);
+		assert.equal(handle.calls.filter((c) => c.method === "PATCH").length, 1);
+		handle.restore();
+	});
+
+	it("refreshes the library version when a keyed multi-object write 412s", async () => {
+		let libraryVersion = 5;
+		const handle = mockFetch((c) => {
+			if (c.method === "GET" && c.url === "http://127.0.0.1:23119/api/") {
+				return { status: 200, body: "x", headers: { "X-Zotero-Server-ID": "SID1" } };
+			}
+			if (c.method === "GET" && c.url.endsWith("/users/0/items?limit=1&format=json")) {
+				const v = libraryVersion;
+				libraryVersion = 9; // the (stale) first read is 5; the retry's re-read sees 9
+				return { status: 200, body: [], headers: { "Last-Modified-Version": String(v) } };
+			}
+			if (c.method === "POST" && c.url.endsWith("/users/0/items")) {
+				const posted = handle.calls.filter((x) => x.method === "POST").length;
+				return posted === 1
+					? { status: 412, body: "Library has been modified since specified version (expected 5, found 9)" }
+					: { status: 200, body: { successful: {}, success: {}, unchanged: {}, failed: {} } };
+			}
+			return undefined;
+		});
+		await createItems({ mode: "local", apiKey: "STORED" }, [{ key: "EXISTS1", itemType: "note" }]);
+		const posts = handle.calls.filter((c) => c.method === "POST");
+		assert.equal(posts.length, 2);
+		assert.equal(posts[0]!.headers["if-unmodified-since-version"], "5");
+		assert.equal(posts[1]!.headers["if-unmodified-since-version"], "9");
+		handle.restore();
+	});
+
+	it("uses the group prefix in local mode", async () => {
+		const handle = mockFetch((c) => (c.url.includes("/groups/7/items?") ? { status: 200, body: [] } : undefined));
+		await searchItems({ ...LOCAL_CFG, groupId: "7" }, {});
+		assert.match(handle.calls[0]!.url, /\/groups\/7\/items\?/);
+		handle.restore();
+	});
+
+	it("download follows the 302 file:// redirect locally", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "zotero-local-"));
+		const source = join(dir, "stored.pdf");
+		const target = join(dir, "paper.pdf");
+		await writeFile(source, "PDFBYTES");
+		const handle = mockFetch((c) =>
+			c.url === "http://127.0.0.1:23119/api/users/0/items/ATT/file"
+				? { status: 302, body: "", headers: { Location: pathToFileURL(source).href } }
+				: undefined,
+		);
+		const result = await downloadAttachmentFile(LOCAL_CFG, { itemKey: "ATT", outputPath: target });
+		assert.equal(result.path, target);
+		assert.equal(result.bytes, 8);
+		assert.equal(result.md5, createHash("md5").update("PDFBYTES").digest("hex"));
+		assert.equal(await readFile(target, "utf8"), "PDFBYTES");
+		handle.restore();
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("itemTemplate uses the Local API when available and 404-falls back to the Web API", async () => {
+		const handle = mockFetch((c) => {
+			if (c.url === "http://127.0.0.1:23119/api/items/new?itemType=note") return { status: 200, body: { itemType: "note" } };
+			return undefined;
+		});
+		const tpl = (await itemTemplate("note", undefined, undefined, LOCAL_CFG)) as { itemType: string };
+		assert.equal(tpl.itemType, "note");
+		handle.restore();
+
+		const handle2 = mockFetch((c) => {
+			if (c.url === "http://127.0.0.1:23119/api/items/new?itemType=note") return { status: 404, body: "Not found" };
+			if (c.url === "https://api.zotero.org/items/new?itemType=note") return { status: 200, body: { itemType: "note", via: "web" } };
+			return undefined;
+		});
+		const tpl2 = (await itemTemplate("note", undefined, undefined, LOCAL_CFG)) as { itemType: string; via?: string };
+		assert.equal(tpl2.via, "web");
+		handle2.restore();
+	});
+
+	it("schema helpers read from the Local API in local mode", async () => {
+		const handle = mockFetch((c) =>
+			c.url === "http://127.0.0.1:23119/api/itemTypes" ? { status: 200, body: [{ itemType: "note", localized: "Note" }] } : undefined,
+		);
+		const types = await listItemTypes(LOCAL_CFG);
+		assert.equal(types[0]!.itemType, "note");
 		handle.restore();
 	});
 });
