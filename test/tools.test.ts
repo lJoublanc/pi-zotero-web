@@ -15,12 +15,13 @@ function harness() {
 	} as unknown as ExtensionAPI;
 	registerZoteroTools(api);
 
-	function ctx(auth: unknown): ExtensionContext {
+	function ctx(auth: unknown, localAuth?: unknown): ExtensionContext {
 		return {
 			cwd: process.cwd(),
 			isProjectTrusted: () => true,
 			modelRegistry: {
-				getProviderAuth: async (providerId: string) => (providerId === "zotero" ? auth : undefined),
+				getProviderAuth: async (providerId: string) =>
+					providerId === "zotero" ? auth : providerId === "zotero-local" ? localAuth : undefined,
 			},
 		} as unknown as ExtensionContext;
 	}
@@ -581,6 +582,48 @@ describe("tools.zotero_fulltext", () => {
 		assert.deepEqual(body, { content: "txt", indexedChars: 3, totalChars: 3 });
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
 		assert.equal(parsed.ok, true);
+		handle.restore();
+	});
+});
+describe("tools.zotero_group_list", () => {
+	it("web mode: lists group memberships from the stored credential", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) =>
+			c.url === "https://api.zotero.org/users/42/groups?limit=100&start=0"
+				? {
+						status: 200,
+						body: [
+							{ id: 6664215, data: { id: 6664215, name: "Luciano's share", type: "Private" }, meta: { numItems: 15, isAdmin: true } },
+						],
+					}
+				: undefined,
+		);
+		const res = await tools.get("zotero_group_list")!.execute("id", {}, undefined, undefined, ctx(AUTH));
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed[0].id, "6664215");
+		assert.equal(parsed[0].name, "Luciano's share");
+		assert.equal(parsed[0].role, "admin");
+		handle.restore();
+	});
+
+	it("local mode: falls back to the stored Web credential (Local API cannot list memberships)", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) =>
+			c.url === "https://api.zotero.org/users/42/groups?limit=100&start=0"
+				? { status: 200, body: [{ id: 5, data: { name: "G2", type: "Private" }, meta: { numItems: 2, isAdmin: false } }] }
+				: undefined,
+		);
+		const res = await tools.get("zotero_group_list")!.execute(
+			"id",
+			{},
+			undefined,
+			undefined,
+			ctx({ auth: { apiKey: "WEBKEY" }, env: { ZOTERO_USER_ID: "42" } }, { auth: { apiKey: "LOCALKEY" }, env: {} }),
+		);
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed[0].id, "5");
+		// The Web credential's key is used, not the active (local) credential's.
+		assert.equal(handle.calls[0]!.headers["zotero-api-key"], "WEBKEY");
 		handle.restore();
 	});
 });

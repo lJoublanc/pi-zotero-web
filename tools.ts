@@ -20,6 +20,7 @@ import {
 	itemTemplate,
 	listCollectionItems,
 	listCollections,
+	listGroups,
 	listCreatorFields,
 	listCreatorTypes,
 	listItemFields,
@@ -63,7 +64,16 @@ async function resolveConfig(ctx: ExtensionContext): Promise<ZoteroConfig> {
 		return { mode: "web", apiKey, userId, groupId: resolved.groupId };
 	}
 	// Local mode: reads are keyless; writes obtain a local key lazily (401 → /api/local/authorize).
-	return { mode: "local", apiKey: resolved.apiKey, userId: "0", groupId: resolved.groupId };
+	// Group listing (Web-API-only) still uses the stored Web credential, if any.
+	const webKey = credentialOfAuth(webAuth)?.key;
+	const webUserId = (webAuth as { env?: Record<string, string | undefined> } | null | undefined)?.env?.ZOTERO_USER_ID;
+	return {
+		mode: "local",
+		apiKey: resolved.apiKey,
+		userId: "0",
+		groupId: resolved.groupId,
+		...(webKey && webUserId ? { webCredentials: { apiKey: webKey, userId: webUserId } } : {}),
+	};
 }
 
 function summarize(items: ZoteroItem[]): unknown[] {
@@ -679,6 +689,21 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "zotero_group_list",
+		label: "Zotero Groups",
+		description:
+			"List the Zotero group libraries (shared libraries) the account belongs to: group id, name, visibility, the account's role, and item count. " +
+			"Group listing is Web-API-only — the Local API mirrors /groups/:id/... but cannot enumerate memberships. " +
+			"To work inside a group library, put its id in the credential's ZOTERO_GROUP_ID env when storing it (/login zotero).",
+		promptSnippet: "List the Zotero group libraries (shared libraries) the account belongs to.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, signal, _onUpdate, ctx) {
+			const cfg = await resolveConfig(ctx);
+			return textResult(await listGroups(cfg, signal));
 		},
 	});
 }

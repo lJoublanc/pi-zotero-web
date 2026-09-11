@@ -33,6 +33,10 @@ export interface ZoteroConfig {
 	mode?: "web" | "local";
 	/** Optional group library id. When set, group libraries are used instead of the personal library. */
 	groupId?: string;
+	/** Stored Web-API credential, when the active mode is "local". Group *listing* is
+	 * Web-API-only (the Local API mirrors /groups/:id/... but cannot enumerate memberships),
+	 * so listGroups falls back to this. */
+	webCredentials?: { apiKey: string; userId: string };
 }
 
 export interface ZoteroItem {
@@ -347,6 +351,57 @@ export async function listCollections(
 			: `${prefix(cfg)}/collections`;
 	const res = await zoteroFetch(cfg, `${path}?${q.toString()}`, { signal });
 	return (await res.json()) as ZoteroCollection[];
+}
+
+/** A Zotero group library the account belongs to (from the Web API). */
+export interface ZoteroGroup {
+	id: string;
+	name: string;
+	/** Group visibility as reported by Zotero, e.g. "Private" or "Public Closed". */
+	type: string;
+	/** Number of items in the group library, when reported. */
+	numItems?: number;
+	/** The account's role in the group. */
+	role: "admin" | "member";
+}
+
+/**
+ * List the group libraries the account belongs to.
+ *
+ * Group *memberships* are a Web-API-only feature: the Local API mirrors
+ * /groups/:id/... but cannot enumerate the groups you are a member of, so this
+ * always talks to api.zotero.org. When the active mode is "local",
+ * cfg.webCredentials (the stored `zotero` credential) supplies the key.
+ */
+export async function listGroups(cfg: ZoteroConfig, signal?: AbortSignal): Promise<ZoteroGroup[]> {
+	const web = cfg.mode === "web" ? cfg : cfg.webCredentials;
+	if (!web?.apiKey || !web.userId) {
+		throw new Error(
+			"Listing Zotero groups requires a Zotero Web credential — the Local API cannot list group memberships. Run /login zotero to add one.",
+		);
+	}
+	const groups: ZoteroGroup[] = [];
+	// Follow Zotero's start/limit paging: a full page means there may be more.
+	for (let start = 0; start <= 1000; start += 100) {
+		const res = await zoteroFetch({ ...web, mode: "web" }, `/users/${web.userId}/groups?limit=100&start=${start}`, { signal });
+		const page = (await res.json()) as Array<{
+			id: number | string;
+			data?: { id?: number | string; name?: string; type?: string };
+			meta?: { numItems?: number; isAdmin?: boolean };
+		}>;
+		for (const g of page) {
+			const group: ZoteroGroup = {
+				id: String(g.data?.id ?? g.id),
+				name: g.data?.name ?? "(unnamed group)",
+				type: g.data?.type ?? "Group",
+				role: g.meta?.isAdmin ? "admin" : "member",
+			};
+			if (g.meta?.numItems !== undefined) group.numItems = g.meta.numItems;
+			groups.push(group);
+		}
+		if (page.length < 100) break;
+	}
+	return groups;
 }
 
 /** Get a single collection by key. */

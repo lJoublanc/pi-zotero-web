@@ -10,6 +10,7 @@ import {
 	ZoteroError,
 	resetZoteroLocalState,
 	addItemsToCollection,
+	listGroups,
 	createCollections,
 	createItems,
 	deleteCollection,
@@ -696,5 +697,44 @@ describe("client local mode", () => {
 		const types = await listItemTypes(LOCAL_CFG);
 		assert.equal(types[0]!.itemType, "note");
 		handle.restore();
+	});
+});
+
+describe("client.listGroups", () => {
+	it("lists group memberships via the Web API", async () => {
+		const handle = mockFetch((c) =>
+			c.url === "https://api.zotero.org/users/21530066/groups?limit=100&start=0"
+				? {
+						status: 200,
+						body: [
+							{
+								id: 6664215,
+								data: { id: 6664215, name: "Luciano's share", type: "Private" },
+								meta: { numItems: 15, isAdmin: true },
+							},
+						],
+					}
+				: undefined,
+		);
+		const groups = await listGroups({ mode: "web", apiKey: "K", userId: "21530066" });
+		assert.deepEqual(groups, [{ id: "6664215", name: "Luciano's share", type: "Private", numItems: 15, role: "admin" }]);
+		handle.restore();
+	});
+
+	it("in local mode falls back to the stored Web credential", async () => {
+		const handle = mockFetch((c) =>
+			c.url === "https://api.zotero.org/users/42/groups?limit=100&start=0"
+				? { status: 200, body: [{ id: 5, data: { name: "G2", type: "Private" } }] }
+				: undefined,
+		);
+		const groups = await listGroups({ mode: "local", apiKey: "LOCAL", userId: "0", webCredentials: { apiKey: "WEB", userId: "42" } });
+		assert.equal(groups[0]!.id, "5");
+		assert.equal(groups[0]!.role, "member");
+		assert.equal(handle.calls[0]!.headers["zotero-api-key"], "WEB");
+		handle.restore();
+	});
+
+	it("without any Web credential explains what to do", async () => {
+		await assert.rejects(() => listGroups({ mode: "local", apiKey: "LOCAL", userId: "0" }), /login zotero/);
 	});
 });
