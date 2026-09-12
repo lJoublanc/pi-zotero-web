@@ -27,6 +27,7 @@ import {
 	listTags,
 	removeItemsFromCollection,
 	searchItems,
+	searchItemsWithVersion,
 	setFullText,
 	setItemTags,
 	updateCollection,
@@ -185,7 +186,10 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		name: "zotero_search",
 		label: "Zotero Search",
 		description:
-			"Search the user's Zotero library for papers/items by keyword, title/author/year, or full text. Returns metadata (key, version, title, creators, abstract, DOI, tags, collections). Use qmode='everything' to also search inside PDFs/full text.",
+			"Search the user's Zotero library for papers/items by keyword, title/author/year, or full text. Returns metadata (key, version, title, creators, abstract, DOI, tags, collections). Use qmode='everything' to also search inside PDFs/full text. " +
+			"Results are NOT relevance-ranked: the server sorts by dateModified unless sort/direction/start are given. " +
+			"Pass itemKey='A,B,C' (up to 50) to fetch exactly those items, ignoring q. " +
+			"Each result includes libraryVersion — pass it as since on a later search to get only items changed meanwhile.",
 		promptSnippet: "Search the Zotero library by keyword or full text.",
 		parameters: Type.Object({
 			q: Type.String({ description: "Search query." }),
@@ -195,12 +199,31 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 			itemType: Type.Optional(Type.String({ description: "Restrict to an item type, e.g. journalArticle." })),
 			collectionKey: Type.Optional(Type.String({ description: "Restrict to a collection key." })),
 			tag: Type.Optional(Type.String({ description: "Restrict to a tag." })),
-			limit: Type.Optional(Type.Number({ description: "Max items to return (default 25)." })),
+			limit: Type.Optional(Type.Number({ description: "Max items to return (default 25; 50 when itemKey is given)." })),
+			start: Type.Optional(Type.Number({ description: "0-based index of the first result. Combine with sort and limit for pagination." })),
+			sort: Type.Optional(
+				Type.String({
+					description:
+						"Sort field. There is NO relevance sort: default is dateModified. Valid: dateAdded, dateModified, title, creator, itemType, date, publisher, publicationTitle, journalAbbreviation, language, accessDate, libraryCatalog, callNumber, rights, addedBy, numItems.",
+				}),
+			),
+			direction: Type.Optional(StringEnum(["asc", "desc"] as const, { description: "Sort direction." })),
+			since: Type.Optional(
+				Type.Number({
+					description:
+						"Library version — return only items modified since this version. Use the libraryVersion returned by a previous search; for incremental sync. 0 = everything.",
+				}),
+			),
+			itemKey: Type.Optional(
+				Type.String({
+					description: "Comma-separated item keys (up to 50) — returns exactly these items, ignoring q. Without an explicit limit, up to 50 are returned.",
+				}),
+			),
 			top: Type.Optional(Type.Boolean({ description: "Return only top-level items (excludes notes/attachments)." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
-			const items = await searchItems(
+			const { items, libraryVersion } = await searchItemsWithVersion(
 				cfg,
 				{
 					q: params.q,
@@ -208,12 +231,21 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 					itemType: params.itemType,
 					collectionKey: params.collectionKey,
 					tag: params.tag,
-					limit: params.limit ?? 25,
+					limit: params.limit ?? (params.itemKey ? 50 : 25),
+					start: params.start,
+					sort: params.sort,
+					direction: params.direction,
+					since: params.since,
+					itemKey: params.itemKey,
 					top: params.top,
 				},
 				signal,
 			);
-			return textResult({ count: items.length, items: summarize(items) });
+			return textResult({
+				count: items.length,
+				...(libraryVersion !== undefined ? { libraryVersion } : {}),
+				items: summarize(items),
+			});
 		},
 	});
 

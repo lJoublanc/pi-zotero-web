@@ -28,6 +28,7 @@ import {
 	listTags,
 	removeItemsFromCollection,
 	searchItems,
+	searchItemsWithVersion,
 	setFullText,
 	setItemTags,
 	updateCollection,
@@ -73,6 +74,59 @@ describe("client.searchItems", () => {
 		);
 		await searchItems(CFG, { q: "x", collectionKey: "COL1" });
 		assert.match(handle.calls[0]!.url, /\/collections\/COL1\/items\?/);
+		handle.restore();
+	});
+
+	it("passes sort, direction, start, and since as query params", async () => {
+		const handle = mockFetch((c) => {
+			assert.match(c.url, /sort=title/);
+			assert.match(c.url, /direction=asc/);
+			assert.match(c.url, /start=100/);
+			assert.match(c.url, /since=17/);
+			assert.match(c.url, /format=json/);
+			return json(200, []);
+		});
+		await searchItems(CFG, { q: "x", sort: "title", direction: "asc", start: 100, since: 17 });
+		handle.restore();
+	});
+
+	it("start=0 must still be sent (0 is a valid pagination index)", async () => {
+		const handle = mockFetch((c) => {
+			assert.match(c.url, /start=0/);
+			return json(200, []);
+		});
+		await searchItems(CFG, { q: "x", start: 0 });
+		handle.restore();
+	});
+
+	it("itemKey hits the plain items path and sets the itemKey query param", async () => {
+		const handle = mockFetch((c) =>
+			c.url.includes("/users/42/items?") ? json(200, [{ key: "K1", version: 1, data: {} }]) : undefined,
+		);
+		const items = await searchItems(CFG, { itemKey: "K1,K2" });
+		assert.equal(items.length, 1);
+		assert.match(handle.calls[0]!.url, /itemKey=K1%2CK2/);
+		assert.doesNotMatch(handle.calls[0]!.url, /\/top\?/);
+		handle.restore();
+	});
+
+	it("searchItemsWithVersion returns the Last-Modified-Version header as libraryVersion", async () => {
+		const handle = mockFetch((c) =>
+			c.url.includes("/users/42/items?")
+				? { status: 200, body: [{ key: "K1", version: 1, data: {} }], headers: { "Last-Modified-Version": "42" } }
+				: undefined,
+		);
+		const { items, libraryVersion } = await searchItemsWithVersion(CFG, { q: "x" });
+		assert.equal(items.length, 1);
+		assert.equal(libraryVersion, 42);
+		handle.restore();
+	});
+
+	it("searchItemsWithVersion tolerates a missing Last-Modified-Version header", async () => {
+		const handle = mockFetch((c) => (c.url.includes("/users/42/items?") ? json(200, []) : undefined));
+		const { items, libraryVersion } = await searchItemsWithVersion(CFG, { q: "x" });
+		assert.equal(items.length, 0);
+		assert.equal(libraryVersion, undefined);
 		handle.restore();
 	});
 

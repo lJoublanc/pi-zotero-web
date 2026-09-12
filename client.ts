@@ -65,6 +65,19 @@ export interface SearchParams {
 	tag?: string;
 	limit?: number;
 	since?: number;
+	/** 0-based index of the first result (pagination; combine with sort and limit). */
+	start?: number;
+	/**
+	 * Sort field. Note: the Zotero API has no relevance sort — results come back
+	 * by the requested field or, by default, dateModified. Valid values:
+	 * dateAdded, dateModified, title, creator, itemType, date, publisher,
+	 * publicationTitle, journalAbbreviation, language, accessDate,
+	 * libraryCatalog, callNumber, rights, addedBy, numItems.
+	 */
+	sort?: string;
+	direction?: "asc" | "desc";
+	/** Comma-separated item keys (up to 50) — fetch exactly these items, ignoring q. */
+	itemKey?: string;
 	/** Return only top-level items (excludes child notes/attachments). */
 	top?: boolean;
 }
@@ -77,8 +90,36 @@ function buildQuery(params: SearchParams): string {
 	if (params.tag) q.set("tag", params.tag);
 	if (params.limit !== undefined) q.set("limit", String(params.limit));
 	if (params.since !== undefined) q.set("since", String(params.since));
+	// 0 is a valid start, so this (unlike the truthy checks above) must use !== undefined.
+	if (params.start !== undefined) q.set("start", String(params.start));
+	if (params.sort) q.set("sort", params.sort);
+	if (params.direction) q.set("direction", params.direction);
+	if (params.itemKey) q.set("itemKey", params.itemKey);
 	q.set("format", "json");
 	return q.toString();
+}
+
+/**
+ * Search the library for items. Returns the results plus the current library
+ * version (from the `Last-Modified-Version` response header) — the watermark to
+ * pass as `since` on the next incremental search.
+ */
+export async function searchItemsWithVersion(
+	cfg: ZoteroConfig,
+	params: SearchParams,
+	signal?: AbortSignal,
+): Promise<{ items: ZoteroItem[]; libraryVersion?: number }> {
+	const base = prefix(cfg);
+	const path = params.collectionKey
+		? `${base}/collections/${params.collectionKey}/items`
+		: params.top
+			? `${base}/items/top`
+			: `${base}/items`;
+	const res = await zoteroFetch(cfg, `${path}?${buildQuery(params)}`, { signal });
+	const raw = res.headers.get("Last-Modified-Version");
+	const lv = raw === null ? Number.NaN : Number(raw);
+	const items = (await res.json()) as ZoteroItem[];
+	return { items, libraryVersion: Number.isFinite(lv) ? lv : undefined };
 }
 
 /** Search the library for items. Returns full item objects with key/version/data. */
@@ -87,14 +128,7 @@ export async function searchItems(
 	params: SearchParams,
 	signal?: AbortSignal,
 ): Promise<ZoteroItem[]> {
-	const base = prefix(cfg);
-	const path = params.collectionKey
-		? `${base}/collections/${params.collectionKey}/items`
-		: params.top
-			? `${base}/items/top`
-			: `${base}/items`;
-	const res = await zoteroFetch(cfg, `${path}?${buildQuery(params)}`, { signal });
-	return (await res.json()) as ZoteroItem[];
+	return (await searchItemsWithVersion(cfg, params, signal)).items;
 }
 
 /** Get a single item by key. */
