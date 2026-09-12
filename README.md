@@ -21,7 +21,7 @@ Install the published npm package (writes to `~/.pi/agent/settings.json`):
 ```bash
 pi install npm:pi-zotero-web
 # or pin a version:
-pi install npm:pi-zotero-web@0.2.2
+pi install npm:pi-zotero-web@0.2.3
 ```
 
 Add `-l` to install into project settings (`.pi/settings.json`) instead of user settings.
@@ -56,7 +56,7 @@ All tools are registered for the agent to call automatically. You can also promp
 
 | Tool | Actions / params | Description |
 |------|------------------|-------------|
-| `zotero_search` | `q`, `qmode`, `itemType`, `collectionKey`, `tag`, `limit`, `top` | Search the library. `qmode=everything` includes full text. Returns key/version/metadata. |
+| `zotero_search` | `q`, `qmode`, `itemType`, `collectionKey`, `tag`, `limit`, `start`, `sort`, `direction`, `since`, `itemKey`, `top` | Search the library. `qmode=everything` includes full text. Results are **not relevance-ranked** — the server's default sort is `dateModified`; pass `sort`/`direction`/`start` to control ordering and paging. `itemKey=a,b,c` fetches up to 50 specific items (ignores `q`). Every result includes `libraryVersion` — pass it back as `since` for incremental sync. |
 | `zotero_item` | `action=get\|create\|update\|delete`, `itemKey`, `version`, `item`, `forceCreate` | CRUD on an item. Use the `version` returned by search/get for update/delete. On `create`, the library is first searched for an existing item with the same DOI (or title + first author); a match is returned with `duplicate:true` instead of creating. Pass `forceCreate:true` to bypass. |
 | `zotero_template` | `itemType`, `linkMode` | Fetch an item template to build valid create/update payloads. |
 | `zotero_attachment` | `action=list\|upload\|download\|delete`, `itemKey`/`parentKey`, `filePath`, `version`, `title`, `contentType` | Manage PDF/attachment files. Upload reads a local file; download writes to a local path. |
@@ -92,6 +92,10 @@ Organize and export:
 Make an uploaded PDF searchable headlessly:
 
 1. Extract text locally (e.g. via a PDF tool), then `zotero_fulltext` `action=set` with `content` + `indexedChars`/`totalChars` (text) or `indexedPages`/`totalPages` (PDF). Now `zotero_search` with `qmode=everything` will find it.
+
+Incrementally sync changed items:
+
+1. `zotero_search` with `since=<lastLibraryVersion>` returns only items created/modified since that version, together with the new `libraryVersion` — store it and pass it as `since` next time. (Deletions are not reported; note that Zotero's `q` search matches phrases only.)
 
 ## Testing
 
