@@ -48,6 +48,43 @@ describe("tools.zotero_search", () => {
 		handle.restore();
 	});
 
+	it("passes start/sort/direction/since/itemKey through to the query", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) =>
+			c.url.includes("/users/42/items?")
+				? { status: 200, headers: { "Last-Modified-Version": "77" }, body: [] }
+				: undefined,
+		);
+		const res = await tools
+			.get("zotero_search")!
+			.execute(
+				"id",
+				{ q: "x", start: 5, sort: "title", direction: "asc", since: 70, itemKey: "K1,K2", limit: 3 },
+				undefined,
+				undefined,
+				ctx(AUTH),
+			);
+		const call = handle.calls[0]!;
+		assert.match(call.url, /start=5/);
+		assert.match(call.url, /sort=title/);
+		assert.match(call.url, /direction=asc/);
+		assert.match(call.url, /since=70/);
+		assert.match(call.url, /limit=3/);
+		assert.match(call.url, /itemKey=K1%2CK2/);
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed.count, 0);
+		assert.equal(parsed.libraryVersion, 77);
+		handle.restore();
+	});
+
+	it("defaults limit to 50 for itemKey lookups", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) => (c.url.includes("/users/42/items?") ? { status: 200, body: [] } : undefined));
+		await tools.get("zotero_search")!.execute("id", { itemKey: "K1" }, undefined, undefined, ctx(AUTH));
+		assert.match(handle.calls[0]!.url, /limit=50/);
+		handle.restore();
+	});
+
 	it("falls back to the Local API read-only when no credentials are stored", async () => {
 		const { tools, ctx } = harness();
 		const handle = mockFetch((c) =>

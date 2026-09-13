@@ -1,4 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Hermetic settings: point the agent dir at an empty temp dir so a developer's
+// real ~/.pi/agent/settings.json (e.g. a personal `zotero.mode: "local"`) or an
+// outer PI_CODING_AGENT_DIR from a host pi session cannot leak into unit tests.
+// getAgentDir() reads this lazily at call time.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-zotero-test-agent-"));
 
 /**
  * Minimal fetch mock for unit tests. Records all calls and returns canned
