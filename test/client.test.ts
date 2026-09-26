@@ -32,6 +32,7 @@ import {
 	removeItemsFromCollection,
 	searchItems,
 	searchItemsWithVersion,
+	getFullTextIndexMap,
 	setFullText,
 	setItemTags,
 	updateCollection,
@@ -559,6 +560,38 @@ describe("client schema", () => {
 		);
 		const fields = await listCreatorFields();
 		assert.equal(fields[0].field, "firstName");
+		handle.restore();
+	});
+});
+
+describe("client full-text index map", () => {
+	it("getFullTextIndexMap GETs /fulltext?since=0 and returns the key map", async () => {
+		const handle = mockFetch((c) =>
+			c.url.endsWith("/users/42/fulltext?since=0") ? json(200, { ATT1: 9, ATT2: 3 }) : undefined,
+		);
+		const map = await getFullTextIndexMap(CFG);
+		assert.deepEqual(map, { ATT1: 9, ATT2: 3 });
+		handle.restore();
+	});
+});
+
+describe("client search totalResults", () => {
+	it("searchItemsWithVersion returns the Total-Results header as totalResults", async () => {
+		const handle = mockFetch((c) =>
+			c.url.includes("/users/42/items?")
+				? { status: 200, body: [{ key: "K1", version: 1, data: {} }], headers: { "Total-Results": "30" } }
+				: undefined,
+		);
+		const { items, totalResults } = await searchItemsWithVersion(CFG, { q: "x", limit: 25 });
+		assert.equal(items.length, 1);
+		assert.equal(totalResults, 30);
+		handle.restore();
+	});
+
+	it("searchItemsWithVersion tolerates a missing Total-Results header", async () => {
+		const handle = mockFetch((c) => (c.url.includes("/users/42/items?") ? json(200, []) : undefined));
+		const { totalResults } = await searchItemsWithVersion(CFG, { q: "x" });
+		assert.equal(totalResults, undefined);
 		handle.restore();
 	});
 });

@@ -85,6 +85,47 @@ describe("tools.zotero_search", () => {
 		handle.restore();
 	});
 
+	it("everything search lists unindexedKeys iff the index map lacks a key", async () => {
+		const items = [
+			{ key: "ATT1", version: 3, data: { itemType: "attachment", title: "paper pdf" } },
+			{ key: "P1", version: 4, data: { itemType: "journalArticle", title: "some paper" } },
+		];
+		const searchMock = (indexMap: Record<string, number>) =>
+			mockFetch((c) => {
+				if (c.url.includes("/users/42/items?"))
+					return { status: 200, headers: { "Total-Results": "2" }, body: items };
+				if (c.url.endsWith("/users/42/fulltext?since=0")) return { status: 200, body: indexMap };
+				if (c.url.includes("/users/42/items/P1/children?")) return { status: 200, body: [] };
+				return undefined;
+			});
+		const { tools, ctx } = harness();
+		// Index map lacks ATT1 -> warned inline; search still returns what is indexed.
+		let handle = searchMock({});
+		let res = await tools.get("zotero_search")!.execute("id", { q: "elu", qmode: "everything" }, undefined, undefined, ctx(AUTH));
+		let parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.deepEqual(parsed.unindexedKeys, ["ATT1"]);
+		assert.equal(parsed.totalResults, 2);
+		handle.restore();
+		// Index map covers ATT1 -> no warning key at all.
+		handle = searchMock({ ATT1: 9 });
+		res = await tools.get("zotero_search")!.execute("id", { q: "elu", qmode: "everything" }, undefined, undefined, ctx(AUTH));
+		parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal("unindexedKeys" in parsed, false);
+		handle.restore();
+	});
+
+	it("JSON results carry the {mode, library} envelope", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) =>
+			c.url.includes("/users/42/items?") ? { status: 200, body: [] } : undefined,
+		);
+		const res = await tools.get("zotero_search")!.execute("id", { q: "x" }, undefined, undefined, ctx(AUTH));
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed.mode, "web");
+		assert.equal(parsed.library, "users/42");
+		handle.restore();
+	});
+
 	it("falls back to the Local API read-only when no credentials are stored", async () => {
 		const { tools, ctx } = harness();
 		const handle = mockFetch((c) =>
@@ -602,20 +643,87 @@ describe("tools.zotero_fulltext", () => {
 		const { tools, ctx } = harness();
 		await assert.rejects(
 			() => tools.get("zotero_fulltext")!.execute("id", { action: "set", itemKey: "ATT" }, undefined, undefined, ctx(AUTH)),
-			/content is required/,
+			/content.*is required for set/,
 		);
+	});
+
+	it("set rejects a missing stats pair with no PUT", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch(() => undefined);
+		await assert.rejects(
+			() =>
+				tools
+					.get("zotero_fulltext")!
+					.execute("id", { action: "set", itemKey: "ATT", content: "txt" }, undefined, undefined, ctx(AUTH)),
+			/One stats pair is required/,
+		);
+		assert.equal(handle.calls.length, 0);
+		handle.restore();
+	});
+
+	it("set reports unchanged:true with zero PUTs when content is identical", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) => {
+			if (c.url.endsWith("/users/42/items/ATT?format=json"))
+				return { status: 200, body: { key: "ATT", version: 9, data: { itemType: "attachment", contentType: "application/pdf" } } };
+			if (c.url.endsWith("/users/42/items/ATT/fulltext") && c.method === "GET")
+				return { status: 200, body: { content: "same", indexedChars: 4, totalChars: 4 } };
+			return undefined;
+		});
+		const res = await tools
+			.get("zotero_fulltext")!
+			.execute("id", { action: "set", itemKey: "ATT", content: "same", indexedChars: 4, totalChars: 4 }, undefined, undefined, ctx(AUTH));
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed.unchanged, true);
+		assert.equal(
+			handle.calls.filter((c) => c.method === "PUT").length,
+			0,
+		);
+		handle.restore();
+	});
+
+	it("set MIME precheck refuses non-PDF attachments before PUT", async () => {
+		const { tools, ctx } = harness();
+		const handle = mockFetch((c) =>
+			c.url.endsWith("/users/42/items/IMG?format=json")
+				? { status: 200, body: { key: "IMG", version: 2, data: { itemType: "attachment", contentType: "image/png" } } }
+				: undefined,
+		);
+		await assert.rejects(
+			() =>
+				tools
+					.get("zotero_fulltext")!
+					.execute(
+						"id",
+						{ action: "set", itemKey: "IMG", content: "txt", indexedChars: 3, totalChars: 3 },
+						undefined,
+						undefined,
+						ctx(AUTH),
+					),
+			/only stored for PDF \/ text \/ EPUB/,
+		);
+		assert.equal(
+			handle.calls.filter((c) => c.method === "PUT").length,
+			0,
+		);
+		handle.restore();
 	});
 
 	it("set PUTs the normalized payload (omits undefined optional fields)", async () => {
 		const { tools, ctx } = harness();
-		const handle = mockFetch((c) =>
-			c.method === "PUT" && c.url.endsWith("/users/42/items/ATT/fulltext") ? { status: 200, body: "" } : undefined,
-		);
+		const handle = mockFetch((c) => {
+			if (c.url.endsWith("/users/42/items/ATT?format=json"))
+				return { status: 200, body: { key: "ATT", version: 9, data: { itemType: "attachment", contentType: "application/pdf" } } };
+			if (c.url.endsWith("/users/42/items/ATT/fulltext"))
+				return c.method === "PUT" ? { status: 204, body: "" } : { status: 404, body: "Not found" };
+			return undefined;
+		});
 		const res = await tools
 			.get("zotero_fulltext")!
 			.execute("id", { action: "set", itemKey: "ATT", content: "txt", indexedChars: 3, totalChars: 3 }, undefined, undefined, ctx(AUTH));
-		const call = handle.calls[0];
-		const body = JSON.parse(call!.body as string);
+		const put = handle.calls.find((c) => c.method === "PUT");
+		assert(put, "expected a PUT to the fulltext endpoint");
+		const body = JSON.parse(put!.body as string);
 		assert.deepEqual(body, { content: "txt", indexedChars: 3, totalChars: 3 });
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
 		assert.equal(parsed.ok, true);

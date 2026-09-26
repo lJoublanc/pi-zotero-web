@@ -2,11 +2,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFile } from "node:fs/promises";
+
 import { ZOTERO_LOCAL_PROVIDER_ID, ZOTERO_PROVIDER_ID } from "./provider.ts";
 import { credentialOfAuth, readZoteroModeSetting, resolveZoteroMode } from "./mode.ts";
 import {
 	type ZoteroConfig,
 	type ZoteroItem,
+	ZoteroError,
 	addItemsToCollection,
 	createCollections,
 	deleteCollection,
@@ -16,6 +21,7 @@ import {
 	getChildren,
 	getCollection,
 	getFullText,
+	getFullTextIndexMap,
 	getItem,
 	itemTemplate,
 	listCollectionItems,
@@ -94,8 +100,38 @@ function summarize(items: ZoteroItem[]): unknown[] {
 	}));
 }
 
-function textResult(obj: unknown) {
-	return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }], details: {} };
+/**
+ * Server-side fulltext cap mirrored client-side: Zotero's
+ * `fulltext.textMaxLength` default (500000 chars; PDFs additionally cap at
+ * `fulltext.pdfMaxPages` = 100 pages server-side). Larger `set` payloads are
+ * refused before the PUT — the server answers 400/413 for them.
+ */
+const MAX_FULLTEXT_CHARS = 500_000;
+
+/** MIME families the fulltext PUT accepts: PDF, any text/*, EPUB. */
+function isIndexableMime(mime: unknown): boolean {
+	if (typeof mime !== "string") return false;
+	const base = mime.split(";")[0]!.trim().toLowerCase();
+	return base === "application/pdf" || base === "application/epub+zip" || base.startsWith("text/");
+}
+
+function libraryOf(cfg: ZoteroConfig): string {
+	if (cfg.groupId) return `groups/${cfg.groupId}`;
+	// resolveConfig() always sets userId ("0" for the local personal library).
+	return `users/${cfg.userId ?? "0"}`;
+}
+
+function textResult(cfg: ZoteroConfig | undefined, obj: unknown) {
+	// Envelope (PLAN 3.3): every JSON result gains {mode, library}. JSON arrays
+	// (schema reads, group listing) pass through bare — the envelope would break
+	// their shape, and the caller already knows the target from context.
+	let body: unknown = obj;
+	if (cfg && obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
+		// Envelope wins on collision: Zotero items/collections already carry a
+		// `library` object, which the routing string replaces.
+		body = { ...(obj as Record<string, unknown>), mode: cfg.mode ?? "web", library: libraryOf(cfg) };
+	}
+	return { content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }], details: {} };
 }
 
 /**
@@ -190,6 +226,29 @@ async function findExistingItem(
 	return undefined;
 }
 
+/**
+ * Resolve an item key to the attachment key whose fulltext `get`/`set`/`download`
+ * act on. Attachments pass through; a parent (regular) item resolves to its
+ * first PDF child (then any first child). Throws when there is no attachment
+ * to address — the caller, not Zotero, then explains what to do.
+ */
+async function resolveAttachmentKey(
+	cfg: ZoteroConfig,
+	itemKey: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const item = await getItem(cfg, itemKey, signal);
+	if (item.data.itemType === "attachment") return item.key;
+	const children = await getChildren(cfg, itemKey, signal);
+	const pdf = children.find(
+		(c) => c.data.itemType === "attachment" && (c.data as Record<string, unknown>).contentType === "application/pdf",
+	);
+	const anyAttachment = children.find((c) => c.data.itemType === "attachment");
+	const hit = pdf ?? anyAttachment;
+	if (!hit) throw new Error(`Item ${itemKey} is not an attachment and has no attachment children — pass an attachment key.`);
+	return hit.key;
+}
+
 /** Normalize the add/remove item-membership params into the shape the client expects. */
 function normalizeMembershipItems(
 	params: { items?: Array<{ key: string; version: number; collections: string[] }>; itemKeys?: string[] },
@@ -200,15 +259,58 @@ function normalizeMembershipItems(
 	);
 }
 
+/**
+ * Attachment keys defining the coverage scope of an `everything` search, diffed
+ * against the fulltext index map to produce `unindexedKeys`.
+ *
+ * - `itemKey` scope: the search returns exactly the requested items, so the
+ *   returned `items` already are the scope (parents expanded to PDF children).
+ * - `collectionKey` scope: direct members refetched (the search page may be a
+ *   subset), top-level items expanded to their attachment children — collections
+ *   hold direct members only.
+ * - Unscoped: attachment hits on this result page. The library-wide blind spot
+ *   can't be enumerated in one call, so page through `start` — each page
+ *   reports its own unindexed attachments.
+ *
+ * Children expansion is capped at 50 parents; the caller treats the whole check
+ * as best-effort (warning only, never fail-hard).
+ */
+async function attachmentKeysInScope(
+	cfg: ZoteroConfig,
+	scope: { collectionKey?: string; items: ZoteroItem[] },
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const members =
+		scope.collectionKey
+			? await listCollectionItems(cfg, scope.collectionKey, { limit: 100 }, signal)
+			: scope.items;
+	const keys: string[] = [];
+	const parents: ZoteroItem[] = [];
+	for (const m of members) {
+		if (m.data.itemType === "attachment") keys.push(m.key);
+		else if (parents.length < 50) parents.push(m);
+	}
+	const children = await Promise.all(
+		parents.map((p) => getChildren(cfg, p.key, signal).catch(() => [] as ZoteroItem[])),
+	);
+	for (const kids of children) {
+		for (const k of kids) {
+			if (k.data.itemType === "attachment") keys.push(k.key);
+		}
+	}
+	return [...new Set(keys)];
+}
+
 export function registerZoteroTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "zotero_search",
 		label: "Zotero Search",
 		description:
 			"Search the user's Zotero library for papers/items by keyword, title/author/year, or full text. Returns metadata (key, version, title, creators, abstract, DOI, tags, collections). Use qmode='everything' to also search inside PDFs/full text. " +
-			"Results are NOT relevance-ranked: the server sorts by dateModified unless sort/direction/start are given. " +
-			"Pass itemKey='A,B,C' (up to 50) to fetch exactly those items, ignoring q. " +
-			"Each result includes libraryVersion — pass it as since on a later search to get only items changed meanwhile.",
+				"Phrase/token matching, NOT relevance-ranked: position 30 == position 3, so do NOT limit:5 everything searches — default limit 25-50, page via start, watch totalResults. titleCreatorYear may keep 5-10. " +
+				"everything needs indexed fulltext (unindexed attachments never match — the response lists them as unindexedKeys when qmode=everything); quote short tokens and single letters. " +
+				"Pass itemKey='A,B,C' (up to 50) to fetch exactly those items, ignoring q. " +
+				"Each result includes libraryVersion — pass it as since on a later search to get only items changed meanwhile.",
 		promptSnippet: "Search the Zotero library by keyword or full text.",
 		parameters: Type.Object({
 			q: Type.String({ description: "Search query." }),
@@ -242,7 +344,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
-			const { items, libraryVersion } = await searchItemsWithVersion(
+			const { items, libraryVersion, totalResults } = await searchItemsWithVersion(
 				cfg,
 				{
 					q: params.q,
@@ -260,9 +362,30 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				},
 				signal,
 			);
-			return textResult({
+			// Coverage (warning only, never fail-hard): on `everything` searches, diff the
+			// requested scope against the fulltext index map so the answer is
+			// self-describing about completeness. A single unindexed item must not
+			// fail the whole query — search still returns what is indexed.
+			let unindexedKeys: string[] | undefined;
+			if (params.qmode === "everything") {
+				try {
+					const indexMap = await getFullTextIndexMap(cfg, signal);
+					const scopeKeys = await attachmentKeysInScope(
+						cfg,
+						{ collectionKey: params.collectionKey, items },
+						signal,
+					);
+					const missing = scopeKeys.filter((k) => !(k in indexMap));
+					if (missing.length) unindexedKeys = missing;
+				} catch {
+					// Best-effort: a failed map fetch must not fail the search itself.
+				}
+			}
+			return textResult(cfg, {
 				count: items.length,
 				...(libraryVersion !== undefined ? { libraryVersion } : {}),
+				...(totalResults !== undefined ? { totalResults } : {}),
+				...(unindexedKeys ? { unindexedKeys } : {}),
 				items: summarize(items),
 			});
 		},
@@ -301,7 +424,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				case "get": {
 					if (!params.itemKey) throw new Error("itemKey is required for get.");
 					const item = await getItem(cfg, params.itemKey, signal);
-					return textResult(item);
+					return textResult(cfg, item);
 				}
 				case "create": {
 					const item = coerceItem(params.item);
@@ -315,11 +438,11 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 					if (!params.forceCreate && items.length === 1) {
 						const existing = await findExistingItem(cfg, items[0] as Record<string, unknown>, signal);
 						if (existing) {
-							return textResult({ duplicate: true, existing: summarize([existing])[0], created: [] });
+							return textResult(cfg, { duplicate: true, existing: summarize([existing])[0], created: [] });
 						}
 					}
 					const created = await createItems(cfg, items as Record<string, unknown>[], signal);
-					return textResult({ created: summarize(created) });
+					return textResult(cfg, { created: summarize(created) });
 				}
 				case "update": {
 					if (!params.itemKey) throw new Error("itemKey is required for update.");
@@ -329,13 +452,13 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						throw new Error("item (patch object) is required for update.");
 					}
 					await updateItem(cfg, params.itemKey, params.version, item as Record<string, unknown>, signal);
-					return textResult({ updated: params.itemKey, ok: true });
+					return textResult(cfg, { updated: params.itemKey, ok: true });
 				}
 				case "delete": {
 					if (!params.itemKey) throw new Error("itemKey is required for delete.");
 					if (params.version === undefined) throw new Error("version is required for delete.");
 					await deleteItem(cfg, params.itemKey, params.version, signal);
-					return textResult({ deleted: params.itemKey, ok: true });
+					return textResult(cfg, { deleted: params.itemKey, ok: true });
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
@@ -358,7 +481,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
 			const template = await itemTemplate(params.itemType, params.linkMode, signal, cfg);
-			return textResult(template);
+			return textResult(cfg, template);
 		},
 	});
 
@@ -393,7 +516,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 					if (!key) throw new Error("itemKey (parent item key) is required for list.");
 					const children = await getChildren(cfg, key, signal);
 					const attachments = children.filter((c) => c.data.itemType === "attachment");
-					return textResult({ count: attachments.length, attachments: summarize(attachments) });
+					return textResult(cfg, { count: attachments.length, attachments: summarize(attachments) });
 				}
 				case "upload": {
 					const parentKey = params.parentKey ?? params.itemKey;
@@ -409,7 +532,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						},
 						signal,
 					);
-					return textResult({ uploaded: created.key, attachment: summarize([created])[0] });
+					return textResult(cfg, { uploaded: created.key, attachment: summarize([created])[0] });
 				}
 				case "download": {
 					if (!params.itemKey) throw new Error("itemKey (attachment key) is required for download.");
@@ -419,13 +542,13 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						{ itemKey: params.itemKey, outputPath: params.filePath },
 						signal,
 					);
-					return textResult(result);
+					return textResult(cfg, result);
 				}
 				case "delete": {
 					if (!params.itemKey) throw new Error("itemKey (attachment key) is required for delete.");
 					if (params.version === undefined) throw new Error("version is required for delete.");
 					await deleteItem(cfg, params.itemKey, params.version, signal);
-				return textResult({ deleted: params.itemKey, ok: true });
+				return textResult(cfg, { deleted: params.itemKey, ok: true });
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
@@ -467,12 +590,12 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 			switch (params.action) {
 				case "list": {
 					const tags = await listTags(cfg, { itemKey: params.itemKey, limit: params.limit ?? 50 }, signal);
-					return textResult({ count: tags.length, tags });
+					return textResult(cfg, { count: tags.length, tags });
 				}
 				case "get": {
 					if (!params.itemKey) throw new Error("itemKey is required for get.");
 					const tags = await listTags(cfg, { itemKey: params.itemKey }, signal);
-					return textResult({ itemKey: params.itemKey, count: tags.length, tags });
+					return textResult(cfg, { itemKey: params.itemKey, count: tags.length, tags });
 				}
 				case "set": {
 					if (!params.itemKey) throw new Error("itemKey is required for set.");
@@ -483,7 +606,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						type: t.type ?? 0,
 					}));
 					await setItemTags(cfg, params.itemKey, params.version, normalized, signal);
-					return textResult({ itemKey: params.itemKey, set: normalized, ok: true });
+					return textResult(cfg, { itemKey: params.itemKey, set: normalized, ok: true });
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
@@ -542,7 +665,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						{ parentKey: params.parentKey, top: params.top, limit: params.limit ?? 50 },
 						signal,
 					);
-					return textResult({
+					return textResult(cfg, {
 						count: cols.length,
 						collections: cols.map((c) => ({
 							key: c.key,
@@ -554,7 +677,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				}
 				case "get": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for get.");
-					return textResult(await getCollection(cfg, params.collectionKey, signal));
+					return textResult(cfg, await getCollection(cfg, params.collectionKey, signal));
 				}
 				case "items": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for items.");
@@ -564,38 +687,38 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						{ top: params.top, limit: params.limit ?? 50 },
 						signal,
 					);
-					return textResult({ count: items.length, items: summarize(items) });
+					return textResult(cfg, { count: items.length, items: summarize(items) });
 				}
 				case "create": {
 					if (!params.name) throw new Error("name is required for create.");
 					const toCreate = [{ name: params.name, parentCollection: params.parentCollection ?? false }];
 					const created = await createCollections(cfg, toCreate, signal);
-					return textResult({ created: created.map((c) => ({ key: c.key, version: c.version, name: c.data.name })) });
+					return textResult(cfg, { created: created.map((c) => ({ key: c.key, version: c.version, name: c.data.name })) });
 				}
 				case "rename": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for rename.");
 					if (params.version === undefined) throw new Error("version is required for rename.");
 					if (!params.name) throw new Error("name is required for rename.");
 					await updateCollection(cfg, params.collectionKey, params.version, { name: params.name }, signal);
-					return textResult({ renamed: params.collectionKey, name: params.name, ok: true });
+					return textResult(cfg, { renamed: params.collectionKey, name: params.name, ok: true });
 				}
 				case "delete": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for delete.");
 					if (params.version === undefined) throw new Error("version is required for delete.");
 					await deleteCollection(cfg, params.collectionKey, params.version, signal);
-					return textResult({ deleted: params.collectionKey, ok: true });
+					return textResult(cfg, { deleted: params.collectionKey, ok: true });
 				}
 				case "add": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for add.");
 					const items = normalizeMembershipItems(params);
 					await addItemsToCollection(cfg, params.collectionKey, items, signal);
-					return textResult({ addedTo: params.collectionKey, count: items.length, ok: true });
+					return textResult(cfg, { addedTo: params.collectionKey, count: items.length, ok: true });
 				}
 				case "remove": {
 					if (!params.collectionKey) throw new Error("collectionKey is required for remove.");
 					const items = normalizeMembershipItems(params);
 					await removeItemsFromCollection(cfg, params.collectionKey, items, signal);
-					return textResult({ removedFrom: params.collectionKey, count: items.length, ok: true });
+					return textResult(cfg, { removedFrom: params.collectionKey, count: items.length, ok: true });
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
@@ -639,7 +762,7 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 				},
 				signal,
 			);
-			return textResult({ format: params.format, chars: exported.length, content: exported });
+			return textResult(undefined, { format: params.format, chars: exported.length, content: exported });
 			},
 	});
 
@@ -664,19 +787,19 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 			const cfg = await resolveConfig(ctx);
 			switch (params.action) {
 				case "itemTypes":
-					return textResult(await listItemTypes(cfg, signal));
+					return textResult(cfg, await listItemTypes(cfg, signal));
 				case "itemFields":
-					return textResult(await listItemFields(cfg, signal));
+					return textResult(cfg, await listItemFields(cfg, signal));
 				case "itemTypeFields": {
 					if (!params.itemType) throw new Error("itemType is required for itemTypeFields.");
-					return textResult(await listItemTypeFields(params.itemType, cfg, signal));
+					return textResult(cfg, await listItemTypeFields(params.itemType, cfg, signal));
 				}
 				case "creatorTypes": {
 					if (!params.itemType) throw new Error("itemType is required for creatorTypes.");
-					return textResult(await listCreatorTypes(params.itemType, cfg, signal));
+					return textResult(cfg, await listCreatorTypes(params.itemType, cfg, signal));
 				}
 				case "creatorFields":
-					return textResult(await listCreatorFields(cfg, signal));
+					return textResult(cfg, await listCreatorFields(cfg, signal));
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
 			}
@@ -687,27 +810,80 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		name: "zotero_fulltext",
 		label: "Zotero Full Text",
 		description:
-			"Get or set extracted full-text content for a Zotero attachment (enables qmode='everything' search without the desktop client). " +
-			"Actions: 'get' (retrieve extracted text for an attachment by key), 'set' (store extracted text for an attachment — use indexedChars/totalChars for text docs, indexedPages/totalPages for PDFs).",
+			"Extracted full-text content for Zotero attachments (what qmode='everything' searches). " +
+			"Actions: 'set' (store caller-supplied extracted text — multi-page text must be joined with \f like Zotero's own extractor; indexedChars/totalChars for text docs or indexedPages/totalPages for PDFs; enables everything-search without the desktop client. An explicit native Reindex later overwrites set text with PDF-extracted text), " +
+			"'download' (write an attachment's fulltext to a tmp file for grep/read — accepts a parent item key, resolving to its PDF child; keeps text out of context), " +
+			"'get' (returns the WHOLE content inline — debugging only; use download for answering).",
 		promptSnippet: "Read or write Zotero attachment full-text content.",
 		parameters: Type.Object({
-			action: StringEnum(["get", "set"] as const, { description: "Full-text action to perform." }),
-			itemKey: Type.String({ description: "Attachment item key." }),
-			content: Type.Optional(Type.String({ description: "Extracted text to store (required for 'set')." })),
+			action: StringEnum(["get", "set", "download"] as const, { description: "Full-text action to perform." }),
+			itemKey: Type.String({ description: "Attachment item key (set/download also accept a parent item key, resolving to its PDF child)." }),
+			content: Type.Optional(Type.String({ description: "Extracted text to store (required for 'set'). Multi-page text: join pages with \f." })),
 			indexedChars: Type.Optional(Type.Number({ description: "Indexed character count (text docs)." })),
 			totalChars: Type.Optional(Type.Number({ description: "Total character count (text docs)." })),
 			indexedPages: Type.Optional(Type.Number({ description: "Indexed page count (PDFs)." })),
 			totalPages: Type.Optional(Type.Number({ description: "Total page count (PDFs)." })),
+			filePath: Type.Optional(Type.String({ description: "Output path for 'download' (default: tmpdir/zotero-fulltext-<KEY>.txt)." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
 			switch (params.action) {
 				case "get": {
+					// Thin pass-through (debugging only): no parent-key resolution,
+					// no MIME precheck — the skill path is `download`, not `get`.
 					const ft = await getFullText(cfg, params.itemKey, signal);
-					return textResult({ itemKey: params.itemKey, ...ft });
+					return textResult(cfg, { itemKey: params.itemKey, ...ft });
 				}
 				case "set": {
-					if (!params.content) throw new Error("content is required for set.");
+					// Hardening (PLAN 3.1): content is ALWAYS caller-supplied --
+					// the tool never extracts, probes converters, or shells out.
+					// Validate locally so failures precede the PUT, not server 400s.
+					if (typeof params.content !== "string" || !params.content.length) {
+						throw new Error("content (non-empty string) is required for set -- extract the PDF yourself, then pass its text.");
+					}
+					const hasCharsPair = params.indexedChars !== undefined || params.totalChars !== undefined;
+					const hasPagesPair = params.indexedPages !== undefined || params.totalPages !== undefined;
+					if (!hasCharsPair && !hasPagesPair) {
+						throw new Error(
+							"One stats pair is required for set: indexedChars/totalChars (text docs) or indexedPages/totalPages (PDFs).",
+						);
+					}
+					for (const [name, v] of [
+						["indexedChars", params.indexedChars],
+						["totalChars", params.totalChars],
+						["indexedPages", params.indexedPages],
+						["totalPages", params.totalPages],
+					] as const) {
+						if (v !== undefined && (!Number.isInteger(v) || v < 0)) {
+							throw new Error(`'${name}' must be a non-negative integer.`);
+						}
+					}
+					if (params.content.length > MAX_FULLTEXT_CHARS) {
+						throw new Error(
+							`content is ${params.content.length} chars -- over Zotero’s ~${MAX_FULLTEXT_CHARS}-char fulltext cap. Truncate (multi-page: keep \\f joins) and retry.`,
+						);
+					}
+					// MIME precheck (always runs): friendlier than the server's
+					// after-the-fact 400 for non-indexable types.
+					const attachmentKey = await resolveAttachmentKey(cfg, params.itemKey, signal);
+					const target = await getItem(cfg, attachmentKey, signal);
+					const mime = (target.data as Record<string, unknown>).contentType;
+					if (!isIndexableMime(mime)) {
+						throw new Error(
+							`Item ${attachmentKey} has contentType ${JSON.stringify(mime ?? "(none)")} -- fulltext is only stored for PDF / text / EPUB attachments.`,
+						);
+					}
+					// Idempotency: mirrors setItemContent's fast path (same text
+					// --> version bump only). Skip the PUT, report unchanged:true.
+					try {
+						const existing = await getFullText(cfg, attachmentKey, signal);
+						if (existing.content === params.content) {
+							return textResult(cfg, { itemKey: attachmentKey, unchanged: true, ok: true });
+						}
+					} catch (err) {
+						if (!(err instanceof ZoteroError) || err.status !== 404) throw err;
+						// No fulltext yet -- fall through to the PUT.
+					}
 					const payload = {
 						content: params.content,
 						...(params.indexedChars !== undefined ? { indexedChars: params.indexedChars } : {}),
@@ -715,8 +891,25 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 						...(params.indexedPages !== undefined ? { indexedPages: params.indexedPages } : {}),
 						...(params.totalPages !== undefined ? { totalPages: params.totalPages } : {}),
 					};
-					await setFullText(cfg, params.itemKey, payload, signal);
-					return textResult({ itemKey: params.itemKey, set: true, ok: true });
+					await setFullText(cfg, attachmentKey, payload, signal);
+					return textResult(cfg, { itemKey: attachmentKey, set: true, ok: true });
+				}
+				case "download": {
+					// Keeps text out of context by construction (PLAN 6 Q3): the
+					// extension owns base URL / prefix / auth; the skill greps the file.
+					const key = await resolveAttachmentKey(cfg, params.itemKey, signal);
+					const ft = await getFullText(cfg, key, signal);
+					const outPath = params.filePath ?? join(tmpdir(), `zotero-fulltext-${key}.txt`);
+					await writeFile(outPath, ft.content, "utf-8");
+					return textResult(cfg, {
+						itemKey: key,
+						path: outPath,
+						chars: ft.content.length,
+						...(ft.indexedPages !== undefined ? { indexedPages: ft.indexedPages } : {}),
+						...(ft.totalPages !== undefined ? { totalPages: ft.totalPages } : {}),
+						...(ft.indexedChars !== undefined ? { indexedChars: ft.indexedChars } : {}),
+						...(ft.totalChars !== undefined ? { totalChars: ft.totalChars } : {}),
+					});
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);
@@ -730,12 +923,12 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		description:
 			"List the Zotero group libraries (shared libraries) the account belongs to: group id, name, visibility, the account's role, and item count. " +
 			"Group listing is Web-API-only — the Local API mirrors /groups/:id/... but cannot enumerate memberships. " +
-			"To work inside a group library, put its id in the credential's ZOTERO_GROUP_ID env when storing it (/login zotero).",
+			"To target a group library, add its id as ZOTERO_GROUP_ID under the credential's env in ~/.pi/agent/auth.json (set manually; /login does not prompt for it).",
 		promptSnippet: "List the Zotero group libraries (shared libraries) the account belongs to.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
-			return textResult(await listGroups(cfg, signal));
+			return textResult(cfg, await listGroups(cfg, signal));
 		},
 	});
 }

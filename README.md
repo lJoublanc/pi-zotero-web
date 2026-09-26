@@ -47,7 +47,7 @@ Install the published npm package (writes to `~/.pi/agent/settings.json`):
 ```bash
 pi install npm:pi-zotero-web
 # or pin a version:
-pi install npm:pi-zotero-web@0.2.3
+pi install npm:pi-zotero-web@0.4.0
 ```
 
 Add `-l` to install into project settings (`.pi/settings.json`) instead of user settings.
@@ -87,7 +87,7 @@ All tools are registered for the agent to call automatically. You can also promp
 
 | Tool | Actions / params | Description |
 |------|------------------|-------------|
-| `zotero_search` | `q`, `qmode`, `itemType`, `collectionKey`, `tag`, `limit`, `start`, `sort`, `direction`, `since`, `itemKey`, `top` | Search the library. `qmode=everything` includes full text. Results are **not relevance-ranked** — the server's default sort is `dateModified`; pass `sort`/`direction`/`start` to control ordering and paging. `itemKey=a,b,c` fetches up to 50 specific items (ignores `q`). Every result includes `libraryVersion` — pass it back as `since` for incremental sync. |
+| `zotero_search` | `q`, `qmode`, `itemType`, `collectionKey`, `tag`, `limit`, `start`, `sort`, `direction`, `since`, `itemKey`, `top` | Search the library. `qmode=everything` includes full text. Phrase/token matching, **not relevance-ranked** (position 30 == position 3): do NOT `limit: 5` `everything` searches — default 25–50, page via `start`, watch `totalResults`. `everything` needs indexed fulltext; the response lists the scope's blind spot as `unindexedKeys` (warning only). `itemKey=a,b,c` fetches up to 50 specific items (ignores `q`). Every result includes `libraryVersion` — pass it back as `since` for incremental sync, plus a `{mode, library}` envelope. |
 | `zotero_item` | `action=get\|create\|update\|delete`, `itemKey`, `version`, `item`, `forceCreate` | CRUD on an item. Use the `version` returned by search/get for update/delete. On `create`, the library is first searched for an existing item with the same DOI (or title + first author); a match is returned with `duplicate:true` instead of creating. Pass `forceCreate:true` to bypass. |
 | `zotero_template` | `itemType`, `linkMode` | Fetch an item template to build valid create/update payloads. |
 | `zotero_attachment` | `action=list\|upload\|download\|delete`, `itemKey`/`parentKey`, `filePath`, `version`, `title`, `contentType` | Manage PDF/attachment files. Upload reads a local file; download writes to a local path. |
@@ -96,7 +96,7 @@ All tools are registered for the agent to call automatically. You can also promp
 | `zotero_export` | `format`, `itemKeys`, `collectionKey` | Export items as BibTeX, BibLaTeX, CSL JSON, RIS, CSV, MODS, COinS, bookmarks, or a formatted bibliography (`bib`). Select by `itemKeys` or a `collectionKey`. |
 | `zotero_group_list` | — | List the Zotero group (shared) libraries the account belongs to: group id, name, visibility, role, item count. Web-API-only — the Local API mirrors `/groups/:id/...` but cannot enumerate memberships. To target a group, store the credential with its id as `ZOTERO_GROUP_ID` (`/login zotero`). |
 | `zotero_schema` | `action=itemTypes\|itemFields\|itemTypeFields\|creatorTypes\|creatorFields`, `itemType` | Read-only access to Zotero's item-type schema (public endpoints, no auth) so the agent can build valid create payloads for exotic types. |
-| `zotero_fulltext` | `action=get\|set`, `itemKey`, `content`, `indexedChars`/`totalChars` or `indexedPages`/`totalPages` | Get or set extracted full-text content for an attachment, enabling `qmode=everything` search without the desktop client. |
+| `zotero_fulltext` | `action=get\|set\|download`, `itemKey`, `content`, `indexedChars`/`totalChars` or `indexedPages`/`totalPages`, `filePath` | `set` stores caller-supplied extracted text (multi-page: join with `\f`; one stats pair required; ~500k-char cap; PDF/text/EPUB only), enabling `qmode=everything` search without the desktop client. `download` writes fulltext to a tmp file for grep/read (accepts a parent key). `get` returns the whole content inline — debugging only. |
 
 ### Typical workflows
 
@@ -123,7 +123,15 @@ Organize and export:
 
 Make an uploaded PDF searchable headlessly:
 
-1. Extract text locally (e.g. via a PDF tool), then `zotero_fulltext` `action=set` with `content` + `indexedChars`/`totalChars` (text) or `indexedPages`/`totalPages` (PDF). Now `zotero_search` with `qmode=everything` will find it.
+1. Extract text locally (e.g. `pdftotext`, `pymupdf4llm`/`pymupdf`/`pypdf` — the agent picks, never the tool), convert to a tmp text file (never into context; multi-page: join pages with `\f`), then `zotero_fulltext` `action=set` with the file's content + `indexedChars`/`totalChars` (text) or `indexedPages`/`totalPages` (PDF). `set` needs only an attachment *record*, not uploaded bytes — a bare stored attachment + `set` is searchable without touching storage quota. Now `zotero_search` with `qmode=everything` will find it. (An explicit native Reindex later overwrites `set` text with PDF-extracted text.)
+
+Answer from a paper without loading it:
+
+1. `zotero_search` with `qmode=everything` (limit 25–50, page via `start`) → candidate attachments.
+2. `zotero_fulltext` `action=download` (accepts a parent key) → tmp text file.
+3. `grep -i -C 5 -m 3` on the file; return ≤ 1200 chars around the best hit plus the nearest heading line. Never claim a page number.
+
+The bundled `zotero-research` skill (`skills/zotero-research/`, auto-loaded with this package) documents the full research loop: budget rules, search strategy, the ingest chain above, the locate pattern, quota fallback, and troubleshooting references.
 
 Incrementally sync changed items:
 
@@ -152,6 +160,7 @@ ln -sfn $PI_TRIPLE/@earendil-works/pi-coding-agent/node_modules/typebox node_mod
 - `provider.ts` registers two native pi-ai `Provider`s — `zotero` (Web) and `zotero-local` (Local) — that declare **no LLM models** (so they never appear in `/model`). Their only purpose is authentication: `/login zotero` verifies the key via `/keys/current`; `/login zotero-local` runs the Local-API `/api/local/authorize` handshake (the consent dialog lives in Zotero).
 - `mode.ts` resolves the effective mode: the `zotero.mode` setting over the stored credentials (local wins when both are stored; no credentials → keyless local read-only). Settings are read via `SettingsManager` (global + trusted project, shallow-merged, project wins) — the extension never writes them.
 - Tools read the resolved credential via `ctx.modelRegistry.getProviderAuth("zotero" | "zotero-local")`. Web requests go to `https://api.zotero.org` with the `Zotero-API-Key` header; local requests go to `http://127.0.0.1:23119/api`, keyless for reads, and for writes add `Zotero-Server-ID`, the local key (401 → `/api/local/authorize` → single retry), and, for keyed multi-object creates, `If-Unmodified-Since-Version` (refreshed on 412).
+- `zotero_search` with `qmode=everything` also fetches the fulltext index map (`GET <prefix>/fulltext?since=0`, keys only) and reports the scope's blind spot as `unindexedKeys` (warning only — search still returns what is indexed). `zotero_fulltext action=set` validates locally (stats pair, ~500k-char cap, PDF/text/EPUB precheck, idempotent skip) and `action=download` writes fulltext to a tmp file so the agent can grep without loading text into context. Every JSON result carries `{mode, library}` (`zotero_export` stays raw).
 - File upload implements Zotero's full 4-step flow (create attachment item → upload authorization → S3 — or, locally, `/api/local/uploads/:key` — `prefix+file+suffix` POST → register upload); downloads follow the local 302 → `file://` redirect by reading the target path directly.
 
 ## License

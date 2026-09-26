@@ -241,13 +241,15 @@ function buildQuery(params: SearchParams): string {
 /**
  * Search the library for items. Returns the results plus the current library
  * version (from the `Last-Modified-Version` response header) — the watermark to
- * pass as `since` on the next incremental search.
+ * pass as `since` on the next incremental search — and the total hit count
+ * (from the `Total-Results` header), which exceeds `items.length` when the
+ * result was paged by `start`/`limit`.
  */
 export async function searchItemsWithVersion(
 	cfg: ZoteroConfig,
 	params: SearchParams,
 	signal?: AbortSignal,
-): Promise<{ items: ZoteroItem[]; libraryVersion?: number }> {
+): Promise<{ items: ZoteroItem[]; libraryVersion?: number; totalResults?: number }> {
 	const base = prefix(cfg);
 	const path = params.collectionKey
 		? `${base}/collections/${params.collectionKey}/items`
@@ -257,8 +259,14 @@ export async function searchItemsWithVersion(
 	const res = await zoteroFetch(cfg, `${path}?${buildQuery(params)}`, { signal });
 	const raw = res.headers.get("Last-Modified-Version");
 	const lv = raw === null ? Number.NaN : Number(raw);
+	const totalRaw = res.headers.get("Total-Results");
+	const total = totalRaw === null ? Number.NaN : Number(totalRaw);
 	const items = (await res.json()) as ZoteroItem[];
-	return { items, libraryVersion: Number.isFinite(lv) ? lv : undefined };
+	return {
+		items,
+		...(Number.isFinite(lv) ? { libraryVersion: lv } : {}),
+		...(Number.isFinite(total) ? { totalResults: total } : {}),
+	};
 }
 
 /** Search the library for items. Returns full item objects with key/version/data. */
@@ -451,11 +459,12 @@ export async function getCollection(
 export async function listCollectionItems(
 	cfg: ZoteroConfig,
 	collectionKey: string,
-	opts: { top?: boolean; limit?: number; q?: string; qmode?: "titleCreatorYear" | "everything" } = {},
+	opts: { top?: boolean; limit?: number; start?: number; q?: string; qmode?: "titleCreatorYear" | "everything" } = {},
 	signal?: AbortSignal,
 ): Promise<ZoteroItem[]> {
 	const q = new URLSearchParams({ format: "json" });
 	if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+	if (opts.start !== undefined) q.set("start", String(opts.start));
 	if (opts.q) q.set("q", opts.q);
 	if (opts.qmode) q.set("qmode", opts.qmode);
 	const sub = opts.top ? "/items/top" : "/items";
@@ -932,8 +941,25 @@ export async function getFullText(
 }
 
 /**
+ * GET <prefix>/fulltext?since=0 — the full-text index map ({ itemKey: version }).
+ * Transfers no content; used to find the blind spot of `qmode=everything`
+ * search (attachments with no indexed fulltext). Available on the Web API and
+ * the Local API (Zotero 10+); `since` is required, 0 means everything.
+ */
+export async function getFullTextIndexMap(
+	cfg: ZoteroConfig,
+	signal?: AbortSignal,
+): Promise<Record<string, number>> {
+	const res = await zoteroFetch(cfg, `${prefix(cfg)}/fulltext?since=0`, { signal });
+	return (await res.json()) as Record<string, number>;
+}
+
+/**
  * PUT /items/<itemKey>/fulltext — set extracted full-text content for an attachment.
  * Use indexedChars/totalChars for text documents, indexedPages/totalPages for PDFs.
+ * Thin wrapper around the PUT: all validation (non-empty content, stats pair,
+ * 500k-char cap, MIME precheck, idempotency) lives in the
+ * `zotero_fulltext action=set` tool handler in tools.ts.
  */
 export async function setFullText(
 	cfg: ZoteroConfig,

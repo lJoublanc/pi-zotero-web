@@ -1,6 +1,6 @@
 {
   "name": "pi-zotero-web",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Zotero integration for pi: CRUD on items + PDFs, library search, tags & collections, citation export, full-text, duplicate detection on create, and /login key management. Talks to the Zotero Web API or the Local API of the running desktop app (auto-detected, `zotero.mode` setting to override).",
   "type": "module",
   "main": "./index.ts",
@@ -9,20 +9,15 @@
     "pi-extension",
     "zotero"
   ],
-  "author": "Kentaroh Toyoda <kentaroh.toyoda@gmail.com> (https://www.linkedin.com/in/kentaroh-toyoda)",
+  "author": "Luciano Joublanc (https://github.com/lJoublanc/pi-zotero-web)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kentaroh-toyoda/pi-zotero-web.git"
+    "url": "git+https://github.com/lJoublanc/pi-zotero-web.git"
   },
-  "homepage": "https://github.com/kentaroh-toyoda/pi-zotero-web",
+  "homepage": "https://github.com/lJoublanc/pi-zotero-web",
   "bugs": {
-    "url": "https://github.com/kentaroh-toyoda/pi-zotero-web/issues"
-  },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "url": "https://github.com/lJoublanc/pi-zotero-web/issues"
   },
   "scripts": {
     "test": "node --experimental-transform-types --test test/*.test.ts",
@@ -45,7 +40,16 @@
     "localAuth.ts",
     "mode.ts",
     "tools.ts",
+    "skills/",
     "README.md",
     "package.json"
-  ]
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills/"
+    ]
+  }
 }
