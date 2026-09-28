@@ -19,8 +19,9 @@ never invent items, keys, or citations.
   exhausting pages or narrowing to zero with distinctive terms.
 - Answer from at most 3 passages. Cite as `Author Year (doi)` from the passage
   metadata, not from memory.
-- Fetch fulltext to a file, never into context (step 6). Never paste a whole
-  document into context.
+- Fulltext NEVER enters context: `zotero_fulltext action=get` writes to a
+  file, `action=set` reads from a file. Both take file paths, never text.
+  Never paste a whole document into context.
 - Writes go one at a time, never in parallel. Re-fetch the item's current
   `version` immediately before every `update`/`delete` (versions move
   silently). Collection adds preserve existing memberships (pass each item's
@@ -36,16 +37,17 @@ never invent items, keys, or citations.
 - `qmode=everything` only matches attachments with indexed fulltext. Every
   `everything` response carries `unindexedKeys` for its scope: an empty hit
   list alongside non-empty `unindexedKeys` means "blind", not "absent" —
-  ingest the missing texts (step 5) and re-run before claiming absence.
-- Absence claims additionally require a dump check (step 6) on the most
+  ingest the missing texts (§4 step 5) and re-run before claiming absence.
+- Absence claims additionally require a locate check (§5) on the most
   promising candidate.
 - On unexpected HTTP errors, read `references/errors.md` before retrying.
 
 ## 3. Answer from passages
 
 1. `zotero_search` with `qmode=everything` (limit 25-50).
-2. For each candidate attachment, `zotero_fulltext action=download`, then
-   `grep -i -C 5 -m 3` on the file and read around the best hit (step 6).
+2. For each candidate attachment, `zotero_fulltext action=get`, then
+   `grep -i -C 5 -m 3` on the returned file and read around the best hit
+   (§5).
 3. Answer ONLY from the returned passages. If they don't cover the question,
    say what's missing and either dump the most promising paper or say so —
    do not pad.
@@ -59,7 +61,7 @@ never invent items, keys, or citations.
 3. Attach the PDF when you have one: `zotero_attachment action=upload` with
    `parentKey=<itemKey>`, `filePath=<the pdf>`.
 4. Fulltext is NOT automatic for API-created items: ALWAYS follow an upload
-   with step 5, or the paper stays invisible to `everything` search.
+   with §4 step 5, or the paper stays invisible to `everything` search.
 5. Convert and `set` (agent-side, skill-guided):
    - Download the bytes via `zotero_attachment action=download` (never
      re-fetch the PDF from the web).
@@ -75,10 +77,11 @@ never invent items, keys, or citations.
    - Convert to a tmp text file — never load the whole converted plaintext
      into context. Multi-page text: join pages with `\f` (mirrors Zotero's
      own extractor: pages joined with `\n\n\f`, no trailing `\f`).
-   - `zotero_fulltext action=set` with the file's content plus one stats
+   - `zotero_fulltext action=set` with `filePath=<that file>` plus one stats
      pair: `indexedPages`/`totalPages` for PDFs, `indexedChars`/`totalChars`
      for text. Reads over ~500k chars / ~100 pages are capped server-side;
-     truncate and note it.
+     truncate and note it. The tool reads the file itself — the text never
+     enters context.
 6. File into collections: `zotero_collection action=add` preserving
    memberships.
 
@@ -89,8 +92,8 @@ attached without uploading the PDF at all. The record is a stored
 (`imported_file`) attachment created bare via `zotero_item action=create`
 with `{"itemType":"attachment","parentItem":"<itemKey>",`
 `"linkMode":"imported_file","title":"<title> - PDF",`
-`"contentType":"application/pdf","tags":[]}`, then `set` with extracted text
-as in step 5. Fulltext does not count against storage quota — only binary
+`"contentType":"application/pdf","tags":[]}`, then `set` with `filePath` to the extracted text
+as in §4 step 5. Fulltext does not count against storage quota — only binary
 files do — so this keeps papers searchable when quota is low or an upload
 fails. No policy or default: just know the option exists, and tell the user
 when you use it. (Note: `linked_file` attachments are rejected for group
@@ -104,10 +107,8 @@ triggers it — it is manual-only, in the desktop app.
 
 1. `qmode=everything` to find candidate attachment(s).
 2. Fetch fulltext **to a file, not into context** via
-   `zotero_fulltext action=download` (accepts a parent item key, resolving to
-   its PDF child). Never `zotero_fulltext action=get` for answering (it
-   returns the WHOLE content inline), never curl, never re-fetch PDFs from
-   the web.
+   `zotero_fulltext action=get` (accepts a parent item key, resolving to
+   its PDF child). Never curl, never re-fetch PDFs from the web.
 3. `grep -i -C 5 -m 3` (or ripgrep) on that file for the distinctive terms;
    `head -c 1200` pipe optional. Return **at most ~800-1200 chars**
    surrounding the best hit **plus the nearest preceding heading-like line

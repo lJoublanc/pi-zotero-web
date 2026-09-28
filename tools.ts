@@ -4,7 +4,7 @@ import { Type } from "typebox";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 
 import { ZOTERO_LOCAL_PROVIDER_ID, ZOTERO_PROVIDER_ID } from "./provider.ts";
 import { credentialOfAuth, readZoteroModeSetting, resolveZoteroMode } from "./mode.ts";
@@ -810,36 +810,59 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 		name: "zotero_fulltext",
 		label: "Zotero Full Text",
 		description:
-			"Extracted full-text content for Zotero attachments (what qmode='everything' searches). " +
-			"Actions: 'set' (store caller-supplied extracted text — multi-page text must be joined with \f like Zotero's own extractor; indexedChars/totalChars for text docs or indexedPages/totalPages for PDFs; enables everything-search without the desktop client. An explicit native Reindex later overwrites set text with PDF-extracted text), " +
-			"'download' (write an attachment's fulltext to a tmp file for grep/read — accepts a parent item key, resolving to its PDF child; keeps text out of context), " +
-			"'get' (returns the WHOLE content inline — debugging only; use download for answering).",
-		promptSnippet: "Read or write Zotero attachment full-text content.",
+			"File-based full-text content for Zotero attachments (what qmode='everything' searches) — text NEVER enters context; both actions move it by file reference only. " +
+			"Actions: 'get' (fetch an attachment's fulltext to a local file for grep/read — accepts a parent item key, resolving to its PDF child), " +
+			"'set' (store extracted text from a local file for an attachment — multi-page text must be joined with \f like Zotero's own extractor; indexedChars/totalChars for text docs or indexedPages/totalPages for PDFs; enables everything-search without the desktop client).",
+		promptSnippet: "Read or write Zotero attachment full-text content via files.",
 		parameters: Type.Object({
-			action: StringEnum(["get", "set", "download"] as const, { description: "Full-text action to perform." }),
-			itemKey: Type.String({ description: "Attachment item key (set/download also accept a parent item key, resolving to its PDF child)." }),
-			content: Type.Optional(Type.String({ description: "Extracted text to store (required for 'set'). Multi-page text: join pages with \f." })),
-			indexedChars: Type.Optional(Type.Number({ description: "Indexed character count (text docs)." })),
-			totalChars: Type.Optional(Type.Number({ description: "Total character count (text docs)." })),
-			indexedPages: Type.Optional(Type.Number({ description: "Indexed page count (PDFs)." })),
-			totalPages: Type.Optional(Type.Number({ description: "Total page count (PDFs)." })),
-			filePath: Type.Optional(Type.String({ description: "Output path for 'download' (default: tmpdir/zotero-fulltext-<KEY>.txt)." })),
+			action: StringEnum(["get", "set"] as const, { description: "Full-text action to perform." }),
+			itemKey: Type.String({ description: "Attachment item key (both actions also accept a parent item key, resolving to its PDF child)." }),
+			filePath: Type.Optional(
+				Type.String({
+					description:
+						"Local text-file path. For 'get': where to write the fulltext (default: tmpdir/zotero-fulltext-<KEY>.txt). For 'set': the file whose content to store (REQUIRED — text is never passed inline).",
+				}),
+			),
+			indexedChars: Type.Optional(Type.Number({ description: "Indexed character count (text docs; 'set' only)." })),
+			totalChars: Type.Optional(Type.Number({ description: "Total character count (text docs; 'set' only)." })),
+			indexedPages: Type.Optional(Type.Number({ description: "Indexed page count (PDFs; 'set' only)." })),
+			totalPages: Type.Optional(Type.Number({ description: "Total page count (PDFs; 'set' only)." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const cfg = await resolveConfig(ctx);
 			switch (params.action) {
 				case "get": {
-					// Thin pass-through (debugging only): no parent-key resolution,
-					// no MIME precheck — the skill path is `download`, not `get`.
-					const ft = await getFullText(cfg, params.itemKey, signal);
-					return textResult(cfg, { itemKey: params.itemKey, ...ft });
+					// The extension owns base URL / prefix / auth; the skill greps the file.
+					const key = await resolveAttachmentKey(cfg, params.itemKey, signal);
+					const ft = await getFullText(cfg, key, signal);
+					const outPath = params.filePath ?? join(tmpdir(), `zotero-fulltext-${key}.txt`);
+					await writeFile(outPath, ft.content, "utf-8");
+					return textResult(cfg, {
+						itemKey: key,
+						path: outPath,
+						chars: ft.content.length,
+						...(ft.indexedPages !== undefined ? { indexedPages: ft.indexedPages } : {}),
+						...(ft.totalPages !== undefined ? { totalPages: ft.totalPages } : {}),
+						...(ft.indexedChars !== undefined ? { indexedChars: ft.indexedChars } : {}),
+						...(ft.totalChars !== undefined ? { totalChars: ft.totalChars } : {}),
+					});
 				}
 				case "set": {
-					// Hardening (PLAN 3.1): content is ALWAYS caller-supplied --
-					// the tool never extracts, probes converters, or shells out.
+					// Hardening: text ALWAYS arrives by file reference — the tool
+					// never takes inline content, extracts, probes converters, or
+					// shells out. Conversion is the agent's job (skill-guided).
 					// Validate locally so failures precede the PUT, not server 400s.
-					if (typeof params.content !== "string" || !params.content.length) {
-						throw new Error("content (non-empty string) is required for set -- extract the PDF yourself, then pass its text.");
+					if (typeof params.filePath !== "string" || !params.filePath.length) {
+						throw new Error("filePath is required for set — convert the PDF to a text file first, then pass its path (text is never passed inline).");
+					}
+					let content: string;
+					try {
+						content = await readFile(params.filePath, "utf-8");
+					} catch (err) {
+						throw new Error(`Cannot read filePath '${params.filePath}': ${(err as Error).message}`);
+					}
+					if (!content.length) {
+						throw new Error(`File '${params.filePath}' is empty — nothing to store.`);
 					}
 					const hasCharsPair = params.indexedChars !== undefined || params.totalChars !== undefined;
 					const hasPagesPair = params.indexedPages !== undefined || params.totalPages !== undefined;
@@ -858,9 +881,9 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 							throw new Error(`'${name}' must be a non-negative integer.`);
 						}
 					}
-					if (params.content.length > MAX_FULLTEXT_CHARS) {
+					if (content.length > MAX_FULLTEXT_CHARS) {
 						throw new Error(
-							`content is ${params.content.length} chars -- over Zotero’s ~${MAX_FULLTEXT_CHARS}-char fulltext cap. Truncate (multi-page: keep \\f joins) and retry.`,
+							`File '${params.filePath}' is ${content.length} chars — over Zotero's ~${MAX_FULLTEXT_CHARS}-char fulltext cap. Truncate (multi-page: keep \\f joins) and retry.`,
 						);
 					}
 					// MIME precheck (always runs): friendlier than the server's
@@ -870,22 +893,22 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 					const mime = (target.data as Record<string, unknown>).contentType;
 					if (!isIndexableMime(mime)) {
 						throw new Error(
-							`Item ${attachmentKey} has contentType ${JSON.stringify(mime ?? "(none)")} -- fulltext is only stored for PDF / text / EPUB attachments.`,
+							`Item ${attachmentKey} has contentType ${JSON.stringify(mime ?? "(none)")} — fulltext is only stored for PDF / text / EPUB attachments.`,
 						);
 					}
 					// Idempotency: mirrors setItemContent's fast path (same text
-					// --> version bump only). Skip the PUT, report unchanged:true.
+					// → version bump only). Skip the PUT, report unchanged:true.
 					try {
 						const existing = await getFullText(cfg, attachmentKey, signal);
-						if (existing.content === params.content) {
+						if (existing.content === content) {
 							return textResult(cfg, { itemKey: attachmentKey, unchanged: true, ok: true });
 						}
 					} catch (err) {
 						if (!(err instanceof ZoteroError) || err.status !== 404) throw err;
-						// No fulltext yet -- fall through to the PUT.
+						// No fulltext yet — fall through to the PUT.
 					}
 					const payload = {
-						content: params.content,
+						content,
 						...(params.indexedChars !== undefined ? { indexedChars: params.indexedChars } : {}),
 						...(params.totalChars !== undefined ? { totalChars: params.totalChars } : {}),
 						...(params.indexedPages !== undefined ? { indexedPages: params.indexedPages } : {}),
@@ -893,23 +916,6 @@ export function registerZoteroTools(pi: ExtensionAPI): void {
 					};
 					await setFullText(cfg, attachmentKey, payload, signal);
 					return textResult(cfg, { itemKey: attachmentKey, set: true, ok: true });
-				}
-				case "download": {
-					// Keeps text out of context by construction (PLAN 6 Q3): the
-					// extension owns base URL / prefix / auth; the skill greps the file.
-					const key = await resolveAttachmentKey(cfg, params.itemKey, signal);
-					const ft = await getFullText(cfg, key, signal);
-					const outPath = params.filePath ?? join(tmpdir(), `zotero-fulltext-${key}.txt`);
-					await writeFile(outPath, ft.content, "utf-8");
-					return textResult(cfg, {
-						itemKey: key,
-						path: outPath,
-						chars: ft.content.length,
-						...(ft.indexedPages !== undefined ? { indexedPages: ft.indexedPages } : {}),
-						...(ft.totalPages !== undefined ? { totalPages: ft.totalPages } : {}),
-						...(ft.indexedChars !== undefined ? { indexedChars: ft.indexedChars } : {}),
-						...(ft.totalChars !== undefined ? { totalChars: ft.totalChars } : {}),
-					});
 				}
 				default:
 					throw new Error(`Unknown action: ${params.action}`);

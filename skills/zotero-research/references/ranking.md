@@ -22,7 +22,7 @@ For each remaining term, score each candidate:
 - item matches ≥ 2 distinct terms: **+2.0**
 
 Sort descending by score. This is a coarse relevance proxy, not a model —
-use it to pick which ≤ 3 attachments deserve a `download` + grep, nothing more.
+use it to pick which ≤ 3 attachments deserve a `get` + grep, nothing more.
 
 ## N-gram anchoring (inside one paper)
 

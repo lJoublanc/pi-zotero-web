@@ -5,7 +5,7 @@
 | `exit 6` / "no response from 127.0.0.1:23119" | Zotero closed or Local API off | Tell the user: start Zotero, Settings → Advanced → "Allow other applications…". Then retry. |
 | 401 on a write (local) | No/invalid local key | The extension re-runs the `/api/local/authorize` handshake automatically → ONE consent dialog pops in Zotero (Allow/Always Allow/Deny). Tell the user, wait, it retries. Prefer **Always Allow** (`/login zotero-local` stores it) or every new key costs a dialog. |
 | 401 on a write (web) | Missing/rejected Web key | Run `/login zotero` to store a fresh key (needs Allow library + file access). |
-| 404 on `fulltext get`/`download` | No fulltext stored for that attachment | The paper was never `set` (API ingests are NOT auto-indexed). Run the ingest chain (SKILL.md §4 step 5) or check `unindexedKeys` on the last search. |
+| 404 on `fulltext get` | No fulltext stored for that attachment | The paper was never `set` (API ingests are NOT auto-indexed). Run the ingest chain (SKILL.md §4 step 5) or check `unindexedKeys` on the last search. |
 | 404 right after a create | Write+read raced | Never write and immediately read in the same breath; serialize, re-GET. |
 | 412 on update/delete | Version moved underneath (versions bump silently) | Re-GET the object, take its fresh `version`, retry once. Always refetch versions for `zotero_item update/delete` and `zotero_collection add`. |
 | 428 on a write (local) | Missing `Zotero-Server-ID` | Shouldn't happen (the extension attaches it from prior responses). If it does: report as a bug. |

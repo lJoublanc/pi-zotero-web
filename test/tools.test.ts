@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { registerZoteroTools } from "../tools.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -627,42 +630,83 @@ describe("tools.zotero_schema", () => {
 });
 
 describe("tools.zotero_fulltext", () => {
-	it("get returns the full-text content", async () => {
+	it("get writes fulltext to a file and returns its path (never inline)", async () => {
 		const { tools, ctx } = harness();
-		const handle = mockFetch((c) =>
-			c.url.endsWith("/users/42/items/ATT/fulltext") ? { status: 200, body: { content: "hello", indexedPages: 2, totalPages: 2 } } : undefined,
-		);
-		const res = await tools.get("zotero_fulltext")!.execute("id", { action: "get", itemKey: "ATT" }, undefined, undefined, ctx(AUTH));
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const out = join(dir, "out.txt");
+		const handle = mockFetch((c) => {
+			if (c.url.endsWith("/users/42/items/ATT?format=json"))
+				return { status: 200, body: { key: "ATT", version: 9, data: { itemType: "attachment", contentType: "application/pdf" } } };
+			if (c.url.endsWith("/users/42/items/ATT/fulltext"))
+				return { status: 200, body: { content: "hello", indexedPages: 2, totalPages: 2 } };
+			return undefined;
+		});
+		const res = await tools.get("zotero_fulltext")!.execute("id", { action: "get", itemKey: "ATT", filePath: out }, undefined, undefined, ctx(AUTH));
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
-		assert.equal(parsed.content, "hello");
+		assert.equal(parsed.path, out);
+		assert.equal(parsed.chars, 5);
 		assert.equal(parsed.indexedPages, 2);
+		assert.equal("content" in parsed, false);
+		assert.equal(await readFile(out, "utf-8"), "hello");
 		handle.restore();
+		await rm(dir, { recursive: true, force: true });
 	});
 
-	it("set requires content", async () => {
+	it("get resolves a parent item key to its PDF child", async () => {
+		const { tools, ctx } = harness();
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const out = join(dir, "out.txt");
+		const handle = mockFetch((c) => {
+			if (c.url.endsWith("/users/42/items/P1?format=json"))
+				return { status: 200, body: { key: "P1", version: 1, data: { itemType: "journalArticle" } } };
+			if (c.url.includes("/users/42/items/P1/children?"))
+				return { status: 200, body: [{ key: "A1", version: 2, data: { itemType: "attachment", contentType: "application/pdf" } }] };
+			if (c.url.endsWith("/users/42/items/A1/fulltext"))
+				return { status: 200, body: { content: "hi", indexedChars: 2, totalChars: 2 } };
+			return undefined;
+		});
+		const res = await tools.get("zotero_fulltext")!.execute("id", { action: "get", itemKey: "P1", filePath: out }, undefined, undefined, ctx(AUTH));
+		const parsed = JSON.parse((res.content[0] as { text: string }).text);
+		assert.equal(parsed.itemKey, "A1");
+		assert.equal(await readFile(out, "utf-8"), "hi");
+		handle.restore();
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("set requires filePath (text is never passed inline)", async () => {
 		const { tools, ctx } = harness();
 		await assert.rejects(
-			() => tools.get("zotero_fulltext")!.execute("id", { action: "set", itemKey: "ATT" }, undefined, undefined, ctx(AUTH)),
-			/content.*is required for set/,
+			() =>
+				tools
+					.get("zotero_fulltext")!
+					.execute("id", { action: "set", itemKey: "ATT", indexedChars: 3, totalChars: 3 }, undefined, undefined, ctx(AUTH)),
+			/filePath is required for set/,
 		);
 	});
 
 	it("set rejects a missing stats pair with no PUT", async () => {
 		const { tools, ctx } = harness();
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const fp = join(dir, "t.txt");
+		await writeFile(fp, "txt");
 		const handle = mockFetch(() => undefined);
 		await assert.rejects(
 			() =>
 				tools
 					.get("zotero_fulltext")!
-					.execute("id", { action: "set", itemKey: "ATT", content: "txt" }, undefined, undefined, ctx(AUTH)),
+					.execute("id", { action: "set", itemKey: "ATT", filePath: fp }, undefined, undefined, ctx(AUTH)),
 			/One stats pair is required/,
 		);
 		assert.equal(handle.calls.length, 0);
 		handle.restore();
+		await rm(dir, { recursive: true, force: true });
 	});
 
-	it("set reports unchanged:true with zero PUTs when content is identical", async () => {
+	it("set reports unchanged:true with zero PUTs when the file matches stored content", async () => {
 		const { tools, ctx } = harness();
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const fp = join(dir, "t.txt");
+		await writeFile(fp, "same");
 		const handle = mockFetch((c) => {
 			if (c.url.endsWith("/users/42/items/ATT?format=json"))
 				return { status: 200, body: { key: "ATT", version: 9, data: { itemType: "attachment", contentType: "application/pdf" } } };
@@ -672,7 +716,7 @@ describe("tools.zotero_fulltext", () => {
 		});
 		const res = await tools
 			.get("zotero_fulltext")!
-			.execute("id", { action: "set", itemKey: "ATT", content: "same", indexedChars: 4, totalChars: 4 }, undefined, undefined, ctx(AUTH));
+			.execute("id", { action: "set", itemKey: "ATT", filePath: fp, indexedChars: 4, totalChars: 4 }, undefined, undefined, ctx(AUTH));
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
 		assert.equal(parsed.unchanged, true);
 		assert.equal(
@@ -680,10 +724,14 @@ describe("tools.zotero_fulltext", () => {
 			0,
 		);
 		handle.restore();
+		await rm(dir, { recursive: true, force: true });
 	});
 
 	it("set MIME precheck refuses non-PDF attachments before PUT", async () => {
 		const { tools, ctx } = harness();
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const fp = join(dir, "t.txt");
+		await writeFile(fp, "txt");
 		const handle = mockFetch((c) =>
 			c.url.endsWith("/users/42/items/IMG?format=json")
 				? { status: 200, body: { key: "IMG", version: 2, data: { itemType: "attachment", contentType: "image/png" } } }
@@ -695,7 +743,7 @@ describe("tools.zotero_fulltext", () => {
 					.get("zotero_fulltext")!
 					.execute(
 						"id",
-						{ action: "set", itemKey: "IMG", content: "txt", indexedChars: 3, totalChars: 3 },
+						{ action: "set", itemKey: "IMG", filePath: fp, indexedChars: 3, totalChars: 3 },
 						undefined,
 						undefined,
 						ctx(AUTH),
@@ -707,10 +755,14 @@ describe("tools.zotero_fulltext", () => {
 			0,
 		);
 		handle.restore();
+		await rm(dir, { recursive: true, force: true });
 	});
 
-	it("set PUTs the normalized payload (omits undefined optional fields)", async () => {
+	it("set reads the file and PUTs the normalized payload (omits undefined optional fields)", async () => {
 		const { tools, ctx } = harness();
+		const dir = await mkdtemp(join(tmpdir(), "zotero-ft-"));
+		const fp = join(dir, "t.txt");
+		await writeFile(fp, "txt");
 		const handle = mockFetch((c) => {
 			if (c.url.endsWith("/users/42/items/ATT?format=json"))
 				return { status: 200, body: { key: "ATT", version: 9, data: { itemType: "attachment", contentType: "application/pdf" } } };
@@ -720,7 +772,7 @@ describe("tools.zotero_fulltext", () => {
 		});
 		const res = await tools
 			.get("zotero_fulltext")!
-			.execute("id", { action: "set", itemKey: "ATT", content: "txt", indexedChars: 3, totalChars: 3 }, undefined, undefined, ctx(AUTH));
+			.execute("id", { action: "set", itemKey: "ATT", filePath: fp, indexedChars: 3, totalChars: 3 }, undefined, undefined, ctx(AUTH));
 		const put = handle.calls.find((c) => c.method === "PUT");
 		assert(put, "expected a PUT to the fulltext endpoint");
 		const body = JSON.parse(put!.body as string);
@@ -728,6 +780,7 @@ describe("tools.zotero_fulltext", () => {
 		const parsed = JSON.parse((res.content[0] as { text: string }).text);
 		assert.equal(parsed.ok, true);
 		handle.restore();
+		await rm(dir, { recursive: true, force: true });
 	});
 });
 describe("tools.zotero_group_list", () => {
