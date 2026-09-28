@@ -1,6 +1,6 @@
 ---
 name: zotero-research
-description: Research over the user's Zotero library via the pi-zotero-web tools: search papers (keyword or full-text), answer from passages, ingest new papers with searchable fulltext. Use for any Zotero search/answer/ingest task.
+description: "Research over the user's Zotero library via the pi-zotero-web tools: search papers (keyword or full-text), answer from passages, ingest new papers with searchable fulltext. Use for any Zotero search/answer/ingest task."
 ---
 
 # Zotero research
